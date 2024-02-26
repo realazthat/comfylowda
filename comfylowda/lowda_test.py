@@ -37,7 +37,7 @@ async def amain():
     comfy_api_url += '/'
 
   provisioner = DumbProvisioner(comfy_remote=ComfyRemoteInfo(
-      comfy_api_url=COMFY_API_URL,
+      comfy_api_url=comfy_api_url,
       upload={},
       download={
           'temp/': IOSpec(io_url=f'comfy+{comfy_api_url}temp/'),
