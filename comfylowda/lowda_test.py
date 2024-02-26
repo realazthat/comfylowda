@@ -94,7 +94,7 @@ async def amain():
       Manager.ExecuteReq(job_id=job_id,
                          workflow=workflow,
                          provisioning=provisioning,
-                         timeout=60))
+                         keepalive=60))
   console.print(res)
 
 

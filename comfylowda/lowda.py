@@ -335,7 +335,7 @@ class ProvisionerBase(ABC):
   class ProvisionReq(BaseModel):
     id: str
     bundle: ProvisioningBundle
-    timeout: int
+    keepalive: float
 
   class ProvisionRes(BaseModel):
     id: str
@@ -343,7 +343,7 @@ class ProvisionerBase(ABC):
 
   class TouchReq(BaseModel):
     id: str
-    timeout: int
+    keepalive: float
 
   class TouchRes(BaseModel):
     success: bool
@@ -391,7 +391,7 @@ class ManagerBase(ABC):
 
     workflow: WorkflowBundle
     provisioning: ProvisioningBundle
-    timeout: int
+    keepalive: float
 
   class ExecuteRes(BaseModel):
     job_id: str
@@ -400,7 +400,7 @@ class ManagerBase(ABC):
 
   class TouchReq(BaseModel):
     job_id: str
-    timeout: int
+    keepalive: float
 
   class TouchRes(BaseModel):
     success: bool
@@ -724,19 +724,19 @@ class Manager(ManagerBase):
         LowdaOutputFieldType.TRIPLET_FILE_B64] = TripletB64OutputFieldEncoder(
             remote=self._remote, tmp_dir_path=self._tmp_dir_path)
 
-  async def _KeepAlive(self, job_id: str, timeout: int) -> None:
+  async def _KeepAlive(self, job_id: str, keepalive: float) -> None:
     try:
       while True:
-        await asyncio.sleep(timeout / 2)
+        await asyncio.sleep(keepalive / 2)
         await self._provisioner.Touch(
-            ProvisionerBase.TouchReq(id=job_id, timeout=timeout))
+            ProvisionerBase.TouchReq(id=job_id, keepalive=keepalive))
     except Exception:
       logger.exception('KeepAlive failed',
                        exc_info=True,
                        stack_info=True,
                        extra={
                            'job_id': job_id,
-                           'timeout': timeout
+                           'keepalive': keepalive
                        })
 
   async def _UploadValue(self, comfy_info: ComfyRemoteInfo,
@@ -862,9 +862,9 @@ class Manager(ManagerBase):
     provisioned = await self._provisioner.Provision(
         ProvisionReq(id=req.job_id,
                      bundle=req.provisioning,
-                     timeout=req.timeout))
+                     keepalive=req.keepalive))
     keepalive_task = asyncio.create_task(
-        self._KeepAlive(req.job_id, req.timeout))
+        self._KeepAlive(req.job_id, req.keepalive))
 
     try:
       async with ComfyAPIClient(
@@ -905,5 +905,5 @@ class Manager(ManagerBase):
   async def Touch(self, req: ManagerBase.TouchReq) -> ManagerBase.TouchRes:
     res: ProvisionerBase.TouchRes
     res = await self._provisioner.Touch(
-        ProvisionerBase.TouchReq(id=req.job_id, timeout=req.timeout))
+        ProvisionerBase.TouchReq(id=req.job_id, keepalive=req.keepalive))
     return ManagerBase.TouchRes(success=res.success, message=res.message)
