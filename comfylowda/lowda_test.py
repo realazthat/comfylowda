@@ -16,12 +16,13 @@ from anyio import Path
 from rich.console import Console
 from slugify import slugify
 
-from .lowda import (APIObjectInfo, APIWorkflow, ComfyRemoteInfo,
-                     DumbProvisioner, FSSpecRemoteFileAPI, IOSpec,
-                     LowdaOutputFieldType, LowdaOutputMapping, Manager,
-                     ManagerBase, ProvisioningBundle, Workflow, WorkflowBundle,
-                     WorkflowTemplateBundle)
 from .comfyfs import RegisterComfyUIFS
+from .lowda import (APIObjectInfo, APIWorkflow, ComfyRemoteInfo,
+                    DumbProvisioner, FSSpecRemoteFileAPI, IOSpec,
+                    LowdaOutputFieldType, LowdaOutputMapping, Manager,
+                    ManagerBase, ProvisioningBundle, Workflow, WorkflowBundle,
+                    WorkflowTemplateBundle)
+
 
 async def amain():
   RegisterComfyUIFS()

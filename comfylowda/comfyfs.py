@@ -13,8 +13,8 @@ from typing import Any, Callable, Literal
 import aiohttp
 import fsspec
 from comfy_catapult.api_client import ComfyAPIClient
+from comfy_catapult.comfy_schema import ComfyUIPathTriplet
 from comfy_catapult.remote_file_api_comfy import ComfySchemeURLToTriplet
-from comfy_catapult.url_utils import ComfyUIPathTriplet
 
 
 class _Writable(fsspec.spec.AbstractBufferedFile):
