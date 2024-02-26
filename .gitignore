@@ -1,0 +1,13 @@
+.venv
+.vscode
+__pycache__
+.deleteme
+.cache
+NOTES.md
+.logs/
+build/
+comfy_lowda.egg-info/
+.deleteme
+**/.deleteme*
+.scrap/
+dist/
