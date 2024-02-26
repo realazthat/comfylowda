@@ -5,7 +5,7 @@ aiosignal >=1,<2
 annotated-types <1
 anyio >=4,<5
 attrs >=23,<24
-comfy_catapult @ git+https://github.com/realazthat/comfy-catapult.git@995a0c4a0ee83779d9712740b35286b2ca890fea
+comfy_catapult @ git+https://github.com/realazthat/comfy-catapult.git@10a5e0fbcd0c6c5e35ede68647ca36911ce9fb29
 frozenlist >=1,<2
 fsspec==2024.2.0
 h11 <1

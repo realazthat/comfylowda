@@ -7,21 +7,25 @@
 
 import asyncio
 import io
+import warnings
 from functools import partial
 from typing import Any, Callable, Literal
 
 import aiohttp
 import fsspec
 from comfy_catapult.api_client import ComfyAPIClient
-from comfy_catapult.comfy_schema import ComfyUIPathTriplet
+from comfy_catapult.comfy_schema import APIUploadImageResp, ComfyUIPathTriplet
 from comfy_catapult.remote_file_api_comfy import ComfySchemeURLToTriplet
 
 
 class _Writable(fsspec.spec.AbstractBufferedFile):
 
-  def __init__(self, done: Callable[[io.BytesIO], None]):
+  def __init__(self, *, fs: Any, path: Any, mode: Any,
+               done: Callable[[io.BytesIO], str]):
+    super().__init__(fs, path, mode)
     self._buffer = io.BytesIO()
     self._done = done
+    self._done_name: str | None = None
 
   def write(self, data: bytes):
     self._buffer.write(data)
@@ -39,17 +43,19 @@ class _Writable(fsspec.spec.AbstractBufferedFile):
     return True
 
   def close(self) -> None:
+    self._done_name = self._done(self._buffer)
     self._buffer.close()
+    super().close()
 
-  @property
-  def closed(self) -> bool:
-    return self._buffer.closed
+  def renamed(self) -> str:
+    if not self._done_name:
+      raise ValueError('File not done writing.')
+    return self._done_name
 
   def __enter__(self) -> '_Writable':
     return self
 
   def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-    self._done(self._buffer)
     self.close()
 
   def seek(self, pos, whence=0):
@@ -76,7 +82,8 @@ class _Writable(fsspec.spec.AbstractBufferedFile):
 
 class _Readable(fsspec.spec.AbstractBufferedFile):
 
-  def __init__(self, buffer: io.BytesIO):
+  def __init__(self, *, fs: Any, path: Any, mode: Any, buffer: io.BytesIO):
+    super().__init__(fs, path, mode, size=buffer.getbuffer().nbytes)
     # Initialize the internal buffer with initial bytes
     self._buffer = buffer
 
@@ -115,11 +122,8 @@ class _Readable(fsspec.spec.AbstractBufferedFile):
         'Flush operation not supported on read-only buffer.')
 
   def close(self):
-    return self._buffer.close()
-
-  @property
-  def closed(self):
-    return self._buffer.closed
+    self._buffer.close()
+    super().close()
 
   def __enter__(self) -> '_Readable':
     return self
@@ -135,24 +139,34 @@ class ComfyUISchemeFSAbstract(fsspec.spec.AbstractFileSystem):
     self._protocol = protocol
 
   async def _DoneWriting(self, buffer: io.BytesIO, *, printable_path: str,
-                         comfy_api_url: str, triplet: ComfyUIPathTriplet):
+                         comfy_api_url: str, triplet: ComfyUIPathTriplet,
+                         overwrite: bool) -> str:
     try:
       async with ComfyAPIClient(comfy_api_url) as api_client:
-        await api_client.PostUploadImage(folder_type=triplet.type,
-                                         subfolder=triplet.subfolder,
-                                         filename=triplet.filename,
-                                         data=buffer.getvalue(),
-                                         overwrite=True)
+        res: APIUploadImageResp
+        res = await api_client.PostUploadImage(folder_type=triplet.type,
+                                               subfolder=triplet.subfolder,
+                                               filename=triplet.filename,
+                                               data=buffer.getvalue(),
+                                               overwrite=overwrite)
+        # Sometimes this can be renamed, if overwrite is False.
+        triplet = ComfyUIPathTriplet(type=res.type,
+                                     subfolder=res.subfolder,
+                                     filename=res.name)
+        rel_path = triplet.ToLocalPathStr(include_folder_type=True)
+        return f'comfy+{self._protocol}://{rel_path}'
     except Exception as e:
       raise IOError(f'Error writing file: {printable_path}') from e
 
   def _DoneWritingSync(self, buffer: io.BytesIO, *, printable_path: str,
-                       comfy_api_url: str, triplet: ComfyUIPathTriplet):
-    asyncio.run(
+                       comfy_api_url: str, triplet: ComfyUIPathTriplet,
+                       overwrite: bool) -> str:
+    return asyncio.run(
         self._DoneWriting(printable_path=printable_path,
                           comfy_api_url=comfy_api_url,
                           triplet=triplet,
-                          buffer=buffer))
+                          buffer=buffer,
+                          overwrite=overwrite))
 
   def _ParsePath(self, path: Any) -> tuple[str, str, ComfyUIPathTriplet]:
     comfy_scheme_url = f'comfy+{self._protocol}://{path}'
@@ -176,22 +190,44 @@ class ComfyUISchemeFSAbstract(fsspec.spec.AbstractFileSystem):
           file_contents = await api_client.GetView(folder_type=triplet.type,
                                                    subfolder=triplet.subfolder,
                                                    filename=triplet.filename)
-          return _Readable(io.BytesIO(file_contents))
+          return _Readable(fs=self,
+                           path=path,
+                           mode=mode,
+                           buffer=io.BytesIO(file_contents))
       except aiohttp.ClientResponseError as e:
         if e.status == 404:
           raise FileNotFoundError(f'File not found: {printable_path}') from e
         raise
       except Exception as e:
         raise IOError(f'Error opening file: {printable_path}') from e
-
-    if mode == 'wb':
-      return _Writable(done=partial(self._DoneWritingSync,
+    elif mode == 'wb':
+      if 'overwrite' not in kwargs:
+        warnings.warn('overwrite not specified, defaulting to True')
+      overwrite: bool = kwargs.get('overwrite', True)
+      return _Writable(fs=self,
+                       path=path,
+                       mode=mode,
+                       done=partial(self._DoneWritingSync,
                                     printable_path=printable_path,
                                     comfy_api_url=comfy_api_url,
-                                    triplet=triplet))
+                                    triplet=triplet,
+                                    overwrite=overwrite))
     raise ValueError(f'Invalid mode: {mode}')
 
   def _open(self, path, mode='rb', **kwargs):
+    """_summary_
+
+    Args:
+        path (_type_): _description_
+        mode (str, optional): Only supports wb and rb. Defaults to 'rb'.
+        kwargs: overwrite: bool, optional. Defaults to True. If False, then upon
+          conflict, the file is automatically renamed by ComfyUI, and the new
+          name can be retrieved by the renamed() method of the returned file
+          object, but ONLY after the file has closed.
+
+    Returns:
+        _Reader|_Writer: The file object.
+    """
     return asyncio.run(self._open_async(path, mode, **kwargs))
 
   def ls(self, path, detail=False, **kwargs):
@@ -211,6 +247,10 @@ class ComfyUISchemeFSAbstract(fsspec.spec.AbstractFileSystem):
       raise
 
   def exists(self, path, **kwargs) -> bool:
+    """Test for path existence.
+    
+    This method is quite expensive; it will download the entire file to test for existence. Use with caution.
+    """
     if not isinstance(path, str):
       raise TypeError(f'path must be a string: {path}')
     return asyncio.run(self._Exists(path))
