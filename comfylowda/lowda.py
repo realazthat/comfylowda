@@ -26,6 +26,7 @@ from comfy_catapult.comfy_schema import (APIHistoryEntry, APINodeID,
                                          APIObjectInfo, APIOutputUI,
                                          APIWorkflow, ComfyFolderType,
                                          ComfyUIPathTriplet)
+from comfy_catapult.comfy_utils import WatchVar
 from pydantic import BaseModel, Field
 from slugify import slugify
 
@@ -151,17 +152,19 @@ class FSSpecRemoteFileAPI(RemoteFileAPIBase):
 
   async def DownloadFile(self, *, untrusted_src_io_spec: IOSpec,
                          trusted_dst_path: Path) -> None:
-    src_fs = self._GetFS(untrusted_src_io_spec.io_url, 'r')
-    trusted_src_io_spec = untrusted_src_io_spec
+    with WatchVar(untrusted_src_io_spec=untrusted_src_io_spec,
+                  trusted_dst_path=trusted_dst_path):
+      src_fs = self._GetFS(untrusted_src_io_spec.io_url, 'r')
+      trusted_src_io_spec = untrusted_src_io_spec
 
-    dst_fs = fsspec.filesystem('file')
-    trusted_dst_io_spec = IOSpec(io_url=trusted_dst_path.as_uri())
+      dst_fs = fsspec.filesystem('file')
+      trusted_dst_io_spec = IOSpec(io_url=trusted_dst_path.as_uri())
 
-    await asyncio.to_thread(self._CopyFileSync,
-                            src_fs=src_fs,
-                            trusted_src_io_spec=trusted_src_io_spec,
-                            dst_fs=dst_fs,
-                            trusted_dst_io_spec=trusted_dst_io_spec)
+      await asyncio.to_thread(self._CopyFileSync,
+                              src_fs=src_fs,
+                              trusted_src_io_spec=trusted_src_io_spec,
+                              dst_fs=dst_fs,
+                              trusted_dst_io_spec=trusted_dst_io_spec)
 
   async def CopyFile(self, *, untrusted_src_io_spec: IOSpec,
                      untrusted_dst_io_spec: IOSpec) -> str:
@@ -235,16 +238,17 @@ class FSSpecRemoteFileAPI(RemoteFileAPIBase):
 
 async def DownloadURLToB64(*, remote: RemoteFileAPIBase, io_spec: IOSpec,
                            tmp_dir_path: Path) -> str:
-  filename = PurePath(urlparse(io_spec.io_url).path).name
-  async with aiofiles.tempfile.TemporaryDirectory(
-      dir=tmp_dir_path) as tmp_child_dir_path:
+  with WatchVar(io_spec=io_spec, tmp_dir_path=tmp_dir_path):
+    filename = PurePath(urlparse(io_spec.io_url).path).name
+    async with aiofiles.tempfile.TemporaryDirectory(
+        dir=tmp_dir_path) as tmp_child_dir_path:
 
-    tmp_path: Path = Path(str(tmp_child_dir_path)) / slugify(filename)
-    tmp_path = await tmp_path.absolute()
-    await remote.DownloadFile(untrusted_src_io_spec=io_spec,
-                              trusted_dst_path=tmp_path)
-    bytes_ = await tmp_path.read_bytes()
-    return base64.b64encode(bytes_).decode('utf-8')
+      tmp_path: Path = Path(str(tmp_child_dir_path)) / slugify(filename)
+      tmp_path = await tmp_path.absolute()
+      await remote.DownloadFile(untrusted_src_io_spec=io_spec,
+                                trusted_dst_path=tmp_path)
+      bytes_ = await tmp_path.read_bytes()
+      return base64.b64encode(bytes_).decode('utf-8')
 
 
 class ComfyRemoteInfo(BaseModel):
