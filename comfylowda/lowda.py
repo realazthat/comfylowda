@@ -207,8 +207,12 @@ class FSSpecRemoteFileAPI(RemoteFileAPIBase):
     final_dst_url = self._GetFinalDstURLSync(dst_fs, trusted_dst_io_spec.io_url)
 
     if src_fs == dst_fs:
-      src_fs.copy(trusted_src_io_spec, final_dst_url)
-      return final_dst_url
+      try:
+        # comfyfs will fail this with NotImplementedError.
+        src_fs.copy(trusted_src_io_spec, final_dst_url)
+        return final_dst_url
+      except NotImplementedError:
+        pass
 
     with src_fs.open(trusted_src_io_spec.io_url, 'rb',
                      **trusted_src_io_spec.kwargs) as src:
