@@ -11,3 +11,4 @@ comfy_lowda.egg-info/
 **/.deleteme*
 .scrap/
 dist/
+.data/
