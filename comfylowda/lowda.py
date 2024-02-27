@@ -22,10 +22,10 @@ import pydash
 from anyio import Path
 from comfy_catapult.api_client import ComfyAPIClient
 from comfy_catapult.catapult import ComfyCatapult
-from comfy_catapult.comfy_schema import (APIHistoryEntry, APIObjectInfo,
-                                         APIOutputUI, APIWorkflow,
-                                         ComfyFolderType, ComfyUIPathTriplet)
-from comfy_catapult.comfy_schema import NodeID as APINodeID
+from comfy_catapult.comfy_schema import (APIHistoryEntry, APINodeID,
+                                         APIObjectInfo, APIOutputUI,
+                                         APIWorkflow, ComfyFolderType,
+                                         ComfyUIPathTriplet)
 from pydantic import BaseModel, Field
 from slugify import slugify
 
