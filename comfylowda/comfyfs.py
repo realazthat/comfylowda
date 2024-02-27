@@ -47,6 +47,7 @@ class _Writable(fsspec.spec.AbstractBufferedFile):
     self._buffer.close()
     super().close()
 
+  @property
   def renamed(self) -> str:
     if not self._done_name:
       raise ValueError('File not done writing.')
