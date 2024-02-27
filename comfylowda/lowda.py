@@ -29,6 +29,8 @@ from comfy_catapult.comfy_schema import NodeID as APINodeID
 from pydantic import BaseModel, Field
 from slugify import slugify
 
+from comfylowda.comfyfs import _Writable
+
 from .comfy_schema import Workflow
 
 logger = logging.getLogger(__name__)
@@ -220,6 +222,8 @@ class FSSpecRemoteFileAPI(RemoteFileAPIBase):
                        **trusted_dst_io_spec.kwargs) as dst:
         for chunk in iter(lambda: src.read(4096), b''):
           dst.write(chunk)  # type: ignore
+      if isinstance(dst, _Writable):
+        return dst.renamed
     return final_dst_url
 
   def _GetFS(self, uri: str, mode: Mode) -> fsspec.spec.AbstractFileSystem:
