@@ -203,7 +203,9 @@ class ComfyUISchemeFSAbstract(fsspec.spec.AbstractFileSystem):
         raise IOError(f'Error opening file: {printable_path}') from e
     elif mode == 'wb':
       if 'overwrite' not in kwargs:
-        warnings.warn('overwrite not specified, defaulting to True')
+        warnings.warn('overwrite not specified, defaulting to True',
+                      UserWarning,
+                      stacklevel=2)
       overwrite: bool = kwargs.get('overwrite', True)
       return _Writable(fs=self,
                        path=path,
