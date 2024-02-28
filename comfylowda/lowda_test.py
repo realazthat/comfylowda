@@ -84,7 +84,7 @@ async def amain():
       user_output_mappings={
           'Preview Image':
           LowdaOutputMapping(
-              node_id='25',
+              node='25',
               comfy_api_field_path='images[0]',
               comfy_api_field_type=LowdaOutputFieldType.TRIPLET_FILE_B64),
       }),

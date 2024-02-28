@@ -12,7 +12,8 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from pathlib import PurePath
-from typing import Annotated, Any, Dict, Hashable, List, Literal, NamedTuple
+from typing import (Annotated, Any, Dict, Hashable, List, Literal, NamedTuple,
+                    Tuple)
 from urllib.parse import urlparse
 
 import aiofiles
@@ -32,7 +33,7 @@ from slugify import slugify
 
 from comfylowda.comfyfs import _Writable
 
-from .comfy_schema import Workflow
+from .comfy_schema import Workflow, WorkflowNode
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,44 @@ def IsJSONSerializable(value: Any) -> bool:
         return False
     return True
   return False
+
+
+def GetNodeName(node: WorkflowNode) -> str | None:
+  return node.properties.get('Node name for S&R', None)
+
+
+def FindNodeByID(*, workflow: Workflow,
+                 node_id: str) -> Tuple[str, str | None, WorkflowNode]:
+  with WatchVar(node_id=node_id):
+    assert isinstance(node_id, str)
+    for node in workflow.nodes:
+      if str(node.id) == node_id:
+        return node_id, GetNodeName(node), node
+    raise ValueError(f'Node with id {json.dumps(node_id)} not found')
+
+
+def FindNodeByName(*, workflow: Workflow,
+                   name: str) -> Tuple[str, str, WorkflowNode]:
+  for node in workflow.nodes:
+    if GetNodeName(node) == name:
+      return str(node.id), name, node
+  raise ValueError(f'Node with name {json.dumps(name)} not found')
+
+
+def FindNode(
+    *, workflow: Workflow,
+    node_id_or_name: int | str) -> Tuple[str, str | None, WorkflowNode]:
+  with WatchVar(node_id_or_name=node_id_or_name):
+    if isinstance(node_id_or_name, int):
+      return FindNodeByID(workflow=workflow, node_id=str(node_id_or_name))
+    if not isinstance(node_id_or_name, str):
+      raise ValueError(
+          f'Invalid node: {node_id_or_name} (expected int or str) got {type(node_id_or_name)}'
+      )
+    try:
+      return FindNodeByName(workflow=workflow, name=node_id_or_name)
+    except ValueError:
+      return FindNodeByID(workflow=workflow, node_id=str(node_id_or_name))
 
 
 class IOSpec(NamedTuple):
@@ -304,28 +343,43 @@ class LowdaOutputFieldType(enum.Enum):
 
 
 class LowdaInputMapping(BaseModel):
-  node_id: APINodeID = Field(
+  node: APINodeID | str | int = Field(
       ...,
-      description='The node_id of a node in the ComfyUI Workflow API format.'
-      ' See https://github.com/realazthat/comfylowda/assets/sdxlturbo_example_api.json for an example Workflow API format'
-  )
+      description=
+      'The id or name of a node in the ComfyUI {API, regular} Workflow.')
   comfy_api_field_path: str = Field(
       ...,
       description=
       'A pydash field path, for the pydash.get() and pydash.set_() functions.'
       ' The field_path begins at the .inputs field of a node in the ComfyUI Workflow API format.'
-      ' See https://github.com/realazthat/comfylowda/assets/sdxlturbo_example_api.json for an example Workflow API format'
-  )
+      ' See https://github.com/realazthat/comfylowda/blob/master/comfylowda/assets/sdxlturbo_example_api.json'
+      ' for an example Workflow API format')
   comfy_api_field_type: LowdaInputFieldType = Field(
-      ..., description='The type of the field.')
+      ...,
+      description=
+      'You can choose a field type to have lowda do some post preprocessing, e.g upload a file.'
+  )
 
 
 class LowdaOutputMapping(BaseModel):
   """Defines a mapping from the /history/{prompt_id} entry to a field in the user output.
   """
-  node_id: APINodeID
-  comfy_api_field_path: str
-  comfy_api_field_type: LowdaOutputFieldType
+  node: APINodeID | str | int = Field(
+      ...,
+      description=
+      'The id or name of a node in the ComfyUI {API, regular} Workflow.')
+  comfy_api_field_path: str = Field(
+      ...,
+      description=
+      'A pydash field path, for the pydash.get() and pydash.set_() functions.'
+      ' The field_path begins at the job_prompt_id.outputs.node_id in the ComfyUI Workflow API format.'
+      ' See https://github.com/realazthat/comfylowda/blob/master/comfylowda/assets/example_history.yaml'
+      ' for an example ComfyUI /history format.')
+  comfy_api_field_type: LowdaOutputFieldType = Field(
+      ...,
+      description=
+      'You can choose a field type to have lowda do some post processing, e.g download a file.'
+  )
 
 
 class WorkflowTemplateBundle(BaseModel):
@@ -756,7 +810,10 @@ class Manager(ManagerBase):
                          prepared_workflow: APIWorkflow,
                          user_input_mapping: LowdaInputMapping,
                          user_input_encoded_value: JSONSerializable) -> None:
-    node_id = user_input_mapping.node_id
+    node_id: APINodeID
+    node_id, _, _ = FindNode(
+        workflow=workflow.template_bundle.workflow_template,
+        node_id_or_name=user_input_mapping.node)
     comfy_api_field_type: LowdaInputFieldType = user_input_mapping.comfy_api_field_type
     if node_id not in prepared_workflow.root:
       raise ValueError(f'{node_id} not in prepared_workflow.root')
@@ -808,7 +865,10 @@ class Manager(ManagerBase):
       self, comfy_info: ComfyRemoteInfo, workflow: WorkflowBundle,
       prepared_workflow: APIWorkflow, history: APIHistoryEntry,
       user_output_mapping: LowdaOutputMapping) -> JSONSerializable:
-    node_id = user_output_mapping.node_id
+    node_id: APINodeID
+    node_id, _, _ = FindNode(
+        workflow=workflow.template_bundle.workflow_template,
+        node_id_or_name=user_output_mapping.node)
     comfy_api_field_type: LowdaOutputFieldType = user_output_mapping.comfy_api_field_type
     if history.outputs is None or node_id not in history.outputs:
       raise ValueError(f'{node_id} not in history.outputs')
