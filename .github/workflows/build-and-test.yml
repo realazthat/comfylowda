@@ -1,0 +1,83 @@
+name: build-and-test
+permissions: read-all
+
+on:
+  push:
+    branches:
+    - master
+    - develop
+    - gh-actions-test
+  pull_request:
+    branches:
+    - master
+    - develop
+env:
+  COMFY_API_URL: http://user:1@localhost:41112
+  CKPT_FILE: .cache/models-for-tests/sd_xl_turbo_1.0_fp16.safetensors
+  CKPT_SHA256: e869ac7d6942cb327d68d5ed83a40447aadf20e0c3358d98b2cc9e270db0da26
+  CKPT_URL: https://huggingface.co/stabilityai/sdxl-turbo/resolve/main/sd_xl_turbo_1.0_fp16.safetensors
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-20.04
+    strategy:
+      matrix:
+        # See https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json
+        python-version:
+        - file: 3.11.0
+          gh: 3.11.0
+
+    steps:
+    - name: Use Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "20"
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version.gh }}
+    - name: Set up .python-version
+      run: |
+        echo "${{ matrix.python-version.file }}"
+        echo "${{ matrix.python-version.file }}" > .python-version
+        cat .python-version
+    - name: Install Bash (Ubuntu)
+      run: sudo apt-get update && sudo apt-get install -y bash wget
+    - name: Install tiv
+      run: |
+        wget https://github.com/stefanhaustein/TerminalImageViewer/archive/8aca9afaf72c4f0d458db62b62b6401f75d6ee8d.zip
+        unzip 8aca9afaf72c4f0d458db62b62b6401f75d6ee8d.zip
+        cd TerminalImageViewer-8aca9afaf72c4f0d458db62b62b6401f75d6ee8d
+        cd src
+        make
+        sudo make install
+    - name: Restore cached files
+      id: restore-cache
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ${CKPT_FILE}
+        key: ${{ runner.os }}-ckpt-${{ env.CKPT_SHA256 }}
+    - name: Download large file
+      run: |
+        if ! echo "${CKPT_SHA256}  ${CKPT_FILE}" | sha256sum --check --status; then
+          echo "Cache miss - downloading file"
+          mkdir -p $(dirname "${CKPT_FILE}")
+          wget -q --continue --show-progress -e dotbytes="4M" -O "${CKPT_FILE}" "${CKPT_URL}"
+          echo "${CKPT_SHA256}  ${CKPT_FILE}" | sha256sum --check --status
+        else
+          echo "Cache hit - file already downloaded"
+        fi
+    - name: Save cached files
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ${CKPT_FILE}
+        key: ${{ steps.restore-cache.outputs.cache-primary-key }}
+    - name: Run ComfyUI for examples and tests
+      run: |
+        bash scripts/run-comfy-for-tests.sh
+    - name: Run everything
+      run: |
+        bash scripts/pre.sh

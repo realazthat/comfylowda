@@ -10,99 +10,179 @@ import base64
 import enum
 import json
 import logging
+import textwrap
 from abc import ABC, abstractmethod
+from datetime import datetime
 from pathlib import PurePath
-from typing import (Annotated, Any, Dict, Hashable, List, Literal, NamedTuple,
-                    Tuple)
+from typing import Annotated, Any, Dict, List, Literal, Tuple
 from urllib.parse import urlparse
 
 import aiofiles
 import fsspec
+import jsonschema
 import pydantic
 import pydash
+import yaml
 from anyio import Path
 from comfy_catapult.api_client import ComfyAPIClient
 from comfy_catapult.catapult import ComfyCatapult
 from comfy_catapult.comfy_schema import (APIHistoryEntry, APINodeID,
                                          APIObjectInfo, APIOutputUI,
-                                         APIWorkflow, ComfyFolderType,
-                                         ComfyUIPathTriplet)
+                                         APIWorkflow, APIWorkflowNodeInfo,
+                                         ComfyFolderType, ComfyUIPathTriplet)
 from comfy_catapult.comfy_utils import WatchVar
-from pydantic import BaseModel, Field
+from datauri import DataURI
+from pydantic import (BaseModel, ConfigDict, Field, RootModel, field_validator,
+                      model_validator)
 from slugify import slugify
 
-from comfylowda.comfyfs import _Writable
-
 from .comfy_schema import Workflow, WorkflowNode
+from .comfyfs import _Writable
 
 logger = logging.getLogger(__name__)
 
-PublicURL = Annotated[str, 'PublicURL']
-LocalURL = Annotated[str, 'LocalURL']
-
-# JSONSerializable = Union[str, int, float, bool, None, Dict[str,
-#                                                            'JSONSerializable'],
-#                          List['JSONSerializable'], Tuple['JSONSerializable',
-#                                                          ...]]
-JSONSerializable = Any
 JSON_SERIALIZABLE_TYPES = (str, int, float, bool, type(None), dict, list, tuple)
 
 
-def IsJSONSerializable(value: Any) -> bool:
-  if isinstance(value, JSON_SERIALIZABLE_TYPES):
-    return True
+def _IsJSONSerializable(value: Any) -> bool:
   if isinstance(value, dict):
     for k, v in value.items():
-      if not IsJSONSerializable(k) or not IsJSONSerializable(v):
+      if not _IsJSONSerializable(k) or not _IsJSONSerializable(v):
         return False
     return True
   if isinstance(value, (list, tuple)):
     for v in value:
-      if not IsJSONSerializable(v):
+      if not _IsJSONSerializable(v):
         return False
     return True
-  return False
+  return isinstance(value, JSON_SERIALIZABLE_TYPES)
 
 
-def GetNodeName(node: WorkflowNode) -> str | None:
+JSONSerializable = Annotated[Any, 'JSONSerializable', _IsJSONSerializable]
+
+
+class _CustomDumper(yaml.Dumper):
+
+  def represent_tuple(self, data):
+    return self.represent_list(data)
+
+
+_CustomDumper.add_representer(tuple, _CustomDumper.represent_tuple)
+
+
+def YamlDump(data: Any) -> str:
+  return yaml.dump(data, indent=2, Dumper=_CustomDumper, sort_keys=False)
+
+
+class _ErrorContext:
+
+  def __init__(self, *, debug_path: Path, key: str):
+    self._debug_path = debug_path
+    self._key = key
+    self._error_context_path = self._debug_path / slugify(self._key)
+    self._context: Dict[str, JSONSerializable] = {}
+
+  async def LargeToFile(self, name: str, msg: JSONSerializable) -> str:
+    directory = self._error_context_path / slugify(datetime.now().isoformat())
+    await directory.mkdir(parents=True, exist_ok=True)
+    path = directory / slugify(name)
+    yaml_path = path.with_suffix('.yaml')
+    await yaml_path.write_text(YamlDump(msg))
+    return yaml_path.as_uri()
+
+  def Add(self, *, name: str, msg: JSONSerializable) -> None:
+    self._context[name] = msg
+
+  def Dump(self) -> JSONSerializable:
+    return self._context
+
+  def Copy(self) -> '_ErrorContext':
+    copy_cxt = _ErrorContext(debug_path=self._debug_path, key=self._key)
+    copy_cxt._context = self._context.copy()
+    return copy_cxt
+
+  def __setitem__(self, key: str, value: JSONSerializable) -> None:
+    self._context[key] = value
+
+
+def _URL(url: str) -> str:
+  # TODO: This should check if the URL is valid; used for documentation.
+  return url
+
+
+def _DiscardPrefix(path: str, prefix: str | None) -> str:
+  if prefix is None:
+    return path
+  if not path.startswith(prefix):
+    raise ValueError(f'Expected {path} to start with {prefix}')
+  return path[len(prefix):]
+
+
+def _PathToTriplet(path: PurePath) -> ComfyUIPathTriplet:
+  # TODO: Migrate this back to comfy_catapult, and also decompose
+  # ComfySchemeURLToTriplet() to use this.
+
+  if path.is_absolute():
+    raise ValueError(
+        f'path => (folder_type, subfolder, filename) must not be absolute: {path}'
+    )
+
+  if len(path.parts) < 3:
+    raise ValueError(
+        f'path => (folder_type, subfolder, filename) must have at least 3 parts: {path}'
+    )
+
+  folder_type_validator = pydantic.TypeAdapter[ComfyFolderType](ComfyFolderType)
+  folder_type: ComfyFolderType = folder_type_validator.validate_python(
+      path.parts[0])
+  subfolder = path.parts[1]
+  filename = path.parts[2]
+  return ComfyUIPathTriplet(type=folder_type,
+                            subfolder=subfolder,
+                            filename=filename)
+
+
+def _GetNodeName(node: WorkflowNode) -> str | None:
   return node.properties.get('Node name for S&R', None)
 
 
-def FindNodeByID(*, workflow: Workflow,
-                 node_id: str) -> Tuple[str, str | None, WorkflowNode]:
+def _FindNodeByID(*, workflow: Workflow,
+                  node_id: str) -> Tuple[str, str | None, WorkflowNode]:
   with WatchVar(node_id=node_id):
-    assert isinstance(node_id, str)
+    if not isinstance(node_id, str):
+      raise ValueError(
+          f'Invalid node_id: {node_id} (expected str) got {type(node_id)}')
     for node in workflow.nodes:
       if str(node.id) == node_id:
-        return node_id, GetNodeName(node), node
+        return node_id, _GetNodeName(node), node
     raise ValueError(f'Node with id {json.dumps(node_id)} not found')
 
 
-def FindNodeByName(*, workflow: Workflow,
-                   name: str) -> Tuple[str, str, WorkflowNode]:
+def _FindNodeByName(*, workflow: Workflow,
+                    name: str) -> Tuple[str, str, WorkflowNode]:
   for node in workflow.nodes:
-    if GetNodeName(node) == name:
+    if _GetNodeName(node) == name:
       return str(node.id), name, node
   raise ValueError(f'Node with name {json.dumps(name)} not found')
 
 
-def FindNode(
+def _FindNode(
     *, workflow: Workflow,
     node_id_or_name: int | str) -> Tuple[str, str | None, WorkflowNode]:
   with WatchVar(node_id_or_name=node_id_or_name):
     if isinstance(node_id_or_name, int):
-      return FindNodeByID(workflow=workflow, node_id=str(node_id_or_name))
+      return _FindNodeByID(workflow=workflow, node_id=str(node_id_or_name))
     if not isinstance(node_id_or_name, str):
       raise ValueError(
           f'Invalid node: {node_id_or_name} (expected int or str) got {type(node_id_or_name)}'
       )
     try:
-      return FindNodeByName(workflow=workflow, name=node_id_or_name)
+      return _FindNodeByName(workflow=workflow, name=node_id_or_name)
     except ValueError:
-      return FindNodeByID(workflow=workflow, node_id=str(node_id_or_name))
+      return _FindNodeByID(workflow=workflow, node_id=str(node_id_or_name))
 
 
-class IOSpec(NamedTuple):
+class IOSpec(BaseModel):
   io_url: str
   """This could be a file URI, or any supported protocol.
   
@@ -115,6 +195,16 @@ class IOSpec(NamedTuple):
   If the comfy+http or comfy+https URL is used, then the ComfyUI API will
   directly be used for upload and download for all upload/download operations.
   """
+
+  @field_validator('io_url')
+  @classmethod
+  def check_io_url(cls, v):
+    try:
+      urlparse(v)
+    except ValueError as e:
+      raise ValueError(f'Invalid URL: {v}') from e
+    return v
+
   kwargs: Dict[str, Any] = {}
   """kwargs to be passed to the fsspec.open() function.
   
@@ -151,7 +241,7 @@ def _RenameURLPath(url: str, counter: int) -> str:
 class FSSpecRemoteFileAPI(RemoteFileAPIBase):
   Mode = Literal['r', 'w', 'rw']
 
-  class Overwrite(enum.Enum):
+  class Overwrite(enum.StrEnum):
     FAIL = enum.auto()
     OVERWRITE = enum.auto()
     RENAME = enum.auto()
@@ -166,13 +256,13 @@ class FSSpecRemoteFileAPI(RemoteFileAPIBase):
         'rw': {},
     }
 
-  def AddFS(self, uri_prefix: str, fs: fsspec.spec.AbstractFileSystem,
+  def AddFS(self, url_prefix: str, fs: fsspec.spec.AbstractFileSystem,
             mode: Mode):
 
-    self._fs[mode][uri_prefix] = fs
+    self._fs[mode][url_prefix] = fs
     if mode == 'rw':
-      self._fs['r'][uri_prefix] = fs
-      self._fs['w'][uri_prefix] = fs
+      self._fs['r'][url_prefix] = fs
+      self._fs['w'][url_prefix] = fs
 
   async def UploadFile(self, *, trusted_src_path: Path,
                        untrusted_dst_io_spec: IOSpec) -> str:
@@ -269,14 +359,15 @@ class FSSpecRemoteFileAPI(RemoteFileAPIBase):
     return final_dst_url
 
   def _GetFS(self, uri: str, mode: Mode) -> fsspec.spec.AbstractFileSystem:
-    for uri_prefix, fs in self._fs[mode].items():
-      if uri.startswith(uri_prefix):
+    for url_prefix, fs in self._fs[mode].items():
+      if uri.startswith(url_prefix):
         return fs
-    raise ValueError(f'No matching FS for {uri}, self._fs: {list(self._fs)}')
+    raise ValueError(
+        f'No matching FS for {json.dumps(uri)}, self._fs: {list(self._fs)}')
 
 
-async def DownloadURLToB64(*, remote: RemoteFileAPIBase, io_spec: IOSpec,
-                           tmp_dir_path: Path) -> str:
+async def _DownloadURLToB64(*, remote: RemoteFileAPIBase, io_spec: IOSpec,
+                            tmp_dir_path: Path) -> str:
   with WatchVar(io_spec=io_spec, tmp_dir_path=tmp_dir_path):
     filename = PurePath(urlparse(io_spec.io_url).path).name
     async with aiofiles.tempfile.TemporaryDirectory(
@@ -290,96 +381,302 @@ async def DownloadURLToB64(*, remote: RemoteFileAPIBase, io_spec: IOSpec,
       return base64.b64encode(bytes_).decode('utf-8')
 
 
+async def _UploadDataURI(*, remote: RemoteFileAPIBase, src_uri: str,
+                         untrusted_dst_io_spec: IOSpec,
+                         tmp_dir_path: Path) -> str:
+  data_uri = DataURI(src_uri)
+  filename = PurePath(urlparse(untrusted_dst_io_spec.io_url).path).name
+  async with aiofiles.tempfile.TemporaryDirectory(
+      dir=tmp_dir_path) as tmp_child_dir_path:
+
+    tmp_path: Path = Path(str(tmp_child_dir_path)) / slugify(filename)
+    tmp_path = await tmp_path.absolute()
+
+    await tmp_path.write_bytes(data_uri.data)
+    return await remote.UploadFile(trusted_src_path=tmp_path,
+                                   untrusted_dst_io_spec=untrusted_dst_io_spec)
+
+
 class ComfyRemoteInfo(BaseModel):
   comfy_api_url: str
   # {prefix => URL}
   upload: Dict[str, IOSpec]
   download: Dict[str, IOSpec]
+  logs: IOSpec | None
 
 
-def GetRemoteIOSpec(*, path: str, prefix2iospec: Dict[str, IOSpec]) -> IOSpec:
+def _GetRemoteIOSpec(*, path: PurePath, prefix2iospec: Dict[str,
+                                                            IOSpec]) -> IOSpec:
+  if path.is_absolute():
+    raise ValueError(f'path must not be absolute: {path}')
+  path_str = str(path)
   for prefix, io_spec in prefix2iospec.items():
-    if path.startswith(prefix):
-
-      return io_spec._replace(io_url=io_spec.io_url + path[len(prefix):])
+    if path_str.startswith(prefix):
+      path_io_url: str = io_spec.io_url + path_str[len(prefix):]
+      return io_spec.model_copy(deep=True, update={'io_url': path_io_url})
   raise ValueError(
-      f'No matching prefix for {path}, prefix2url: {prefix2iospec}')
+      f'No matching prefix for {json.dumps(path)}, prefix2url: {prefix2iospec}')
 
 
 class ProvisioningBundle(BaseModel):
-  files: Dict[str, PublicURL | LocalURL]
-  archives: Dict[str, PublicURL | LocalURL]
-  custom_nodes: Dict[str, PublicURL | LocalURL]
+  files: Dict[str, IOSpec]
+  archives: Dict[str, IOSpec]
+  custom_nodes: Dict[str, IOSpec]
 
 
-class LowdaInputFieldType(enum.Enum):
-  LITERAL = enum.auto()
+class InputPPKind(enum.Enum):
+  VALUE = enum.auto()
   """Anything JSON Serializable. Just gets passed through."""
-  JSON_STR = enum.auto()
-  """A JSON string. Gets deserialized."""
-  FILE_B64 = enum.auto()
-  """JSON Serializable dict that will be validated using JSONFileB64."""
-  TRIPLET_FILE_B64 = enum.auto()
-  """JSON Serializable dict that will be validated using JSONTripletB64."""
+  FILE = enum.auto()
+  """A file. Gets uploaded according to the upload spec."""
 
 
-class JSONFileB64(BaseModel):
-  filename: str
-  content_b64: str
+class UserIOSpec(RootModel[IOSpec | str]):
+  root: IOSpec | str
+
+  @field_validator('root')
+  @classmethod
+  def check_root(cls, v):
+    if isinstance(v, str):
+      try:
+        urlparse(v)
+      except ValueError as e:
+        raise ValueError(f'Invalid URL: {v}') from e
+    return v
+
+  def ToIOSpec(self) -> IOSpec:
+    if not isinstance(self.root, str):
+      return self.root
+    return IOSpec(io_url=self.root)
 
 
-class JSONFileTripletB64(BaseModel):
-  folder_type: ComfyFolderType
-  subfolder: str
-  filename: str
-  content_b64: str
+def _ParseUserIOSpec(user_input_value: JSONSerializable) -> UserIOSpec:
+  io_spec_validator = pydantic.TypeAdapter[UserIOSpec](UserIOSpec)
+  if not isinstance(user_input_value, str):
+    return io_spec_validator.validate_python(user_input_value)
+  try:
+    return io_spec_validator.validate_json(user_input_value)
+  except pydantic.ValidationError:
+    return UserIOSpec(root=user_input_value)
 
 
-class LowdaOutputFieldType(enum.Enum):
-  LITERAL = enum.auto()
-  JSON_STR = enum.auto()
-  FILE_B64 = enum.auto()
-  TRIPLET_FILE_B64 = enum.auto()
+class FileUploadMapSpec(BaseModel):
+  upload_to: str | ComfyUIPathTriplet = Field(
+      ...,
+      description="""Location to upload the file to.
+
+Either a path relative to ComfyUI installation, or a triplet.
+
+The path must not be absolute.
+
+Note that some nodes only allow certain subfolders, e.g 'temp' or 'output/custom_node_name'.""",
+      alias='to')
+
+  @field_validator('upload_to')
+  @classmethod
+  def check_upload_to(cls, v):
+    if isinstance(v, str):
+      if PurePath(v).is_absolute():
+        raise ValueError(f'upload_to must not be absolute: {v}')
+    return v
+
+  node_mode: Literal['TRIPLET', 'FILEPATH'] = Field(
+      ...,
+      description="""How the node expects the filepath to be passed in as input.
+
+Some nodes expect a triplet, some expect a relative filepath string.
+
+For those that expect a relative filepath string, some expect it relative to
+the ComfyUI installation path, and some expect it relative to the 'input'
+folder; others use other relative paths, such as 'input/custom_node_inputs/'
+or even in some non-standard relative path (this is only supported if the
+provisioned ComfyUI instance is specified with a way to upload files other
+than the ComfyUI API, because the ComfyUI API only supports upload to
+`/path/to/comfyui/input`).
+
+See discard_prefix.
+""",
+      alias='mode')
+  discard_prefix: str | None = Field(
+      ...,
+      description=
+      """The prefix to be discarded from the filepath when passing the filepath to the node.
+
+This should only be used with FILEPATH mode, and only if node expects filepath
+strings to be relative to something other than the ComfyUI root path.
+
+Some nodes assume that a filepath is relative to a certain path.
+
+For example, the 'Load Image' node assumes that the filepath is relative to
+the 'input' folder. So the prefix for that should be 'input/'.
+
+This prefix should not start with a slash.
+
+Note on trailing slash: different nodes may or may not require a trailing
+slash here; depending on if the node expects a slash in the beginning of the
+file path.
+""",
+      alias='pfx')
+
+  @field_validator('discard_prefix')
+  @classmethod
+  def check_discard_prefix(cls, v):
+    if v is not None:
+      if not isinstance(v, str):
+        raise ValueError(f'discard_prefix must be str or None: {v}')
+      if PurePath(v).is_absolute():
+        raise ValueError(f'discard_prefix must not be absolute: {v}')
+    return v
+
+  @model_validator(mode='after')
+  def check_prefix_implies_filename(self):
+    prefix_implies_filename = (self.discard_prefix is None
+                               or self.node_mode == 'FILEPATH')
+    if not prefix_implies_filename:
+      raise ValueError(
+          'discard_prefix is only valid when node_mode is FILEPATH')
+    return self
 
 
-class LowdaInputMapping(BaseModel):
+class FileDownloadMapSpec(BaseModel):
+  """If this is set, then a node output will be interpreted as a file and downloaded according to a user specified spec.
+
+  This class specifies how to extract the file from the node output and download it.
+
+  The user must specify an input value to specify the download URL to their system.
+
+  They can either use a globally accessible IOSpec, or a string 'base64'.
+
+  TODO: Show example.
+  """
+  node_mode: Literal['TRIPLET', 'FILEPATH'] = Field(
+      ...,
+      description=
+      f"""How the node output (see {_URL("https://github.com/realazthat/comfylowda/blob/master/comfylowda/assets/example_history.yaml")}) outputs the filepath.
+
+Some nodes output a triplet, some output a filepath, some output a filepath that is relative to a certain path inside the ComfyUI installation.
+""",
+      alias='mode')
+  prepend_prefix: str | None = Field(
+      ...,
+      description=
+      """The prefix to be prepended to the filepath reading the value from the node.
+
+Some nodes assume that a filepath is relative to a certain path.
+
+This tells the downloader to prepend the prefix in order to find the file.
+  """,
+      alias='pfx')
+
+  @field_validator('prepend_prefix')
+  @classmethod
+  def check_prepend_prefix(cls, v):
+    if v is not None:
+      if not isinstance(v, str):
+        raise ValueError(f'prepend_prefix must be str or None: {v}')
+      if PurePath(v).is_absolute():
+        raise ValueError(f'prepend_prefix must not be absolute: {v}')
+    return v
+
+  @model_validator(mode='after')
+  def check_exclusivity(self):
+    prefix_implies_filename = (self.prepend_prefix is None
+                               or self.node_mode == 'FILEPATH')
+    if not prefix_implies_filename:
+      raise ValueError(
+          'prepend_prefix is only valid when node_mode is FILEPATH')
+    return self
+
+
+class OutputPPKind(enum.StrEnum):
+  NODE_VALUE = enum.auto()
+  """Anything JSON Serializable. Just gets passed through as an output value."""
+  FILE = enum.auto()
+  """JSON Serializable dict that will be validated using DownloadFile."""
+
+
+class InputMapping(BaseModel):
+  name: str = Field(
+      ...,
+      description=
+      'The name of the input. This is the key that the user will be expected to use in their input JSON.'
+  )
   node: APINodeID | str | int = Field(
       ...,
       description=
-      'The id or name of a node in the ComfyUI {API, regular} Workflow.')
-  comfy_api_field_path: str = Field(
-      ...,
-      description=
-      'A pydash field path, for the pydash.get() and pydash.set_() functions.'
-      ' The field_path begins at the .inputs field of a node in the ComfyUI Workflow API format.'
-      ' See https://github.com/realazthat/comfylowda/blob/master/comfylowda/assets/sdxlturbo_example_api.json'
-      ' for an example Workflow API format')
-  comfy_api_field_type: LowdaInputFieldType = Field(
-      ...,
-      description=
-      'You can choose a field type to have lowda do some post preprocessing, e.g upload a file.'
+      'The id or unique title of a node in the ComfyUI {API, regular} Workflow.'
   )
+  field: str | None = Field(
+      ...,
+      description=
+      f"""A pydash field path, for the pydash.get() and pydash.set_() functions.
+
+The field_path begins at the .inputs field of a node in the ComfyUI Workflow API format.'
+See {_URL('https://github.com/realazthat/comfylowda/blob/master/comfylowda/assets/sdxlturbo_example_api.json')}
+for an example Workflow API format. If specified, this will copy the'
+input value to the field path.
+""")
+  pp: InputPPKind = Field(
+      ..., description='You can choose a preprocessor, e.g upload a file.')
+  pp_spec: FileUploadMapSpec | None = Field(
+      None, description='If pp==FILE, then this is required.', alias='spec')
+
+  @model_validator(mode='after')
+  def check_exclusivity(self):
+    if (self.pp == InputPPKind.FILE) != (self.pp_spec is not None):
+      raise ValueError(
+          'If pp!=VALUE, then pp_spec is required. Otherwise, it must be None.')
+    return self
+
+  user_json_spec: Literal['NO_PUBLIC_INPUT'] | Literal['ANY'] | Literal[
+      'OPT_ANY'] | dict = Field(
+          ..., description='JSON spec to verify the user input.')
+  user_value: JSONSerializable = Field(
+      ..., description='The default input value to use.')
 
 
-class LowdaOutputMapping(BaseModel):
+class OutputMapping(BaseModel):
   """Defines a mapping from the /history/{prompt_id} entry to a field in the user output.
   """
+  model_config = ConfigDict(use_enum_values=True)
+  name: str = Field(
+      ...,
+      description="""
+The name of the output. This is the key that will be used in the output JSON.
+
+If this mapping requires user input, this is the key that the user will be
+expected to use in their output JSON.
+""")
   node: APINodeID | str | int = Field(
       ...,
       description=
-      'The id or name of a node in the ComfyUI {API, regular} Workflow.')
-  comfy_api_field_path: str = Field(
+      'The id or unique title of a node in the ComfyUI {API, regular} Workflow')
+  field: str = Field(
       ...,
       description=
       'A pydash field path, for the pydash.get() and pydash.set_() functions.'
       ' The field_path begins at the job_prompt_id.outputs.node_id in the ComfyUI Workflow API format.'
       ' See https://github.com/realazthat/comfylowda/blob/master/comfylowda/assets/example_history.yaml'
       ' for an example ComfyUI /history format.')
-  comfy_api_field_type: LowdaOutputFieldType = Field(
+  pp: OutputPPKind = Field(
       ...,
       description=
       'You can choose a field type to have lowda do some post processing, e.g download a file.'
   )
+  pp_spec: FileDownloadMapSpec | None = Field(
+      ..., description='If pp!=VALUE, then this is required.', alias='spec')
+  user_json_spec: Literal['NO_PUBLIC_INPUT'] | Literal['ANY'] | Literal[
+      'OPT_ANY'] | dict = Field(
+          ..., description='JSON spec to verify the user input.')
+  user_value: JSONSerializable = Field(
+      ..., description='The default input value to use.')
+
+  @model_validator(mode='after')
+  def check_exclusivity(self):
+    if (self.pp == OutputPPKind.FILE) != (self.pp_spec is not None):
+      raise ValueError(
+          'If pp!=VALUE, then pp_spec is required. Otherwise, it must be None.')
+    return self
 
 
 class WorkflowTemplateBundle(BaseModel):
@@ -387,8 +684,8 @@ class WorkflowTemplateBundle(BaseModel):
   api_workflow_template: APIWorkflow
   important: List[APINodeID]
   object_info: APIObjectInfo
-  user_input_mappings: Dict[str, LowdaInputMapping]
-  user_output_mappings: Dict[str, LowdaOutputMapping]
+  input_mappings: List[InputMapping]
+  output_mappings: List[OutputMapping]
 
 
 class WorkflowBundle(BaseModel):
@@ -441,10 +738,6 @@ class DumbProvisioner(ProvisionerBase):
 
 class ManagerBase(ABC):
 
-  # @abstractmethod
-  # async def Serve(self, workflow: WorkflowTemplateBundle, endpoint_path: str) -> None:
-  #   raise NotImplementedError()
-
   class ExecuteReq(BaseModel):
     job_id: str
 
@@ -481,284 +774,202 @@ class ManagerBase(ABC):
     raise NotImplementedError()
 
 
-def TripletDictToTriplet(triplet_dict: dict) -> ComfyUIPathTriplet:
-
-  # file_dict: dict = pydash.get(node_outputs.root, field_path)
-
-  if 'filename' not in triplet_dict:
-    raise Exception(f'Expected "filename" in {triplet_dict}')
-  filename: str = triplet_dict['filename']
-  if not isinstance(filename, str):
-    raise Exception(f'Expected "filename" to be str, got {type(filename)}')
-  if 'subfolder' not in triplet_dict:
-    raise Exception(f'Expected "subfolder" in {triplet_dict}')
-  subfolder: str = triplet_dict['subfolder']
-  if not isinstance(subfolder, str):
-    raise Exception(f'Expected "subfolder" to be str, got {type(subfolder)}')
-  if 'type' not in triplet_dict:
-    raise Exception(f'Expected "type" in {triplet_dict}')
-  folder_type: Literal['temp', 'output'] = triplet_dict['type']
-  if not isinstance(folder_type, str):
-    raise Exception(f'Expected "type" to be str, got {type(folder_type)}')
-  if folder_type not in ['temp', 'output']:
-    raise Exception(
-        f'Expected "type" to be "temp" or "output", got {folder_type}')
-
-  return ComfyUIPathTriplet(type=folder_type,
-                            subfolder=subfolder,
-                            filename=filename)
-
-
-def NodeOutputToTriplets(node_id: APINodeID, job_history: APIHistoryEntry,
-                         field_path: Hashable | List[Hashable],
-                         comfy_api_url: str) -> List[ComfyUIPathTriplet]:
-  """
-  * field_path=='gifs' works for Video Combine
-  * field_path=='images' works for Preview Image
-
-
-
-  Example Preview Image Workflow API json:
-
-  ```
-  '25':
-    inputs:
-      images:
-      - '8'
-      - 0
-    class_type: PreviewImage
-    meta:
-      title: Preview Image
-  ```
-
-  Example Preview Image node output:
-
-  ```
-  outputs:
-    '25':
-      images:
-      - filename: ComfyUI_temp_huntb_00001_.png
-        subfolder: ''
-        type: temp
-  ```
-
-  Example Video Combine node output:
-
-  TODO: Put an example here.
-
-  Args:
-      node_id: The node_id.
-      job_history: The job_history.
-      field_path: A pydash field path, for the pydash.get() and pydash.set_()
-        functions.
-      comfy_api_url: e.g http://127.0.0.1:8188.
-  """
-  if job_history.outputs is None:
-    raise AssertionError('job_history.outputs is None')
-
-  if node_id not in job_history.outputs:
-    raise Exception(f'{node_id} not in job_history.outputs')
-
-  node_outputs: APIOutputUI = job_history.outputs[node_id]
-
-  triplet_dicts: List[dict] = pydash.get(node_outputs.root, field_path)
-  if not isinstance(triplet_dicts, (list, tuple)):
-    raise Exception(
-        f'Expected triplet_dicts to be list, got {type(triplet_dicts)}')
-
-  return [TripletDictToTriplet(triplet_dict) for triplet_dict in triplet_dicts]
-
-
-def NodeOutputToTriplet(node_id: APINodeID, job_history: APIHistoryEntry,
-                        field_path: Hashable | List[Hashable],
-                        comfy_api_url: str) -> ComfyUIPathTriplet:
-  """
-  * field_path=='gifs[0]' works for Video Combine
-  * field_path=='images[0]' works for Preview Image
-
-
-
-  Example Preview Image Workflow API json:
-
-  ```
-  '25':
-    inputs:
-      images:
-      - '8'
-      - 0
-    class_type: PreviewImage
-    meta:
-      title: Preview Image
-  ```
-
-  Example Preview Image node output:
-
-  ```
-  outputs:
-    '25':
-      images:
-      - filename: ComfyUI_temp_huntb_00001_.png
-        subfolder: ''
-        type: temp
-  ```
-
-  Example Video Combine node output:
-
-  TODO: Put an example here.
-
-  Args:
-      node_id: The node_id.
-      job_history: The job_history.
-      field_path: A pydash field path, for the pydash.get() and pydash.set_()
-        functions.
-      comfy_api_url: e.g http://127.0.0.1:8188.
-  """
-  if job_history.outputs is None:
-    raise AssertionError('job_history.outputs is None')
-
-  if node_id not in job_history.outputs:
-    raise Exception(f'{node_id} not in job_history.outputs')
-
-  node_outputs: APIOutputUI = job_history.outputs[node_id]
-
-  triplet_dict: dict = pydash.get(node_outputs.root, field_path)
-  if not isinstance(triplet_dict, (dict)):
-    raise Exception(
-        f'Expected triplet_dict to be dict, got {type(triplet_dict)}')
-
-  return TripletDictToTriplet(triplet_dict)
-
-
-def GetTripletFileIOSpec(*, triplet: ComfyUIPathTriplet,
-                         remote_info: ComfyRemoteInfo,
-                         mode: Literal['upload', 'download']) -> IOSpec:
+def _GetTripletFileIOSpec(*, triplet: ComfyUIPathTriplet,
+                          remote_info: ComfyRemoteInfo,
+                          mode: Literal['upload', 'download']) -> IOSpec:
   remote_path = triplet.ToLocalPathStr(include_folder_type=True)
   if mode == 'download':
-    download_io_spec = GetRemoteIOSpec(path=remote_path,
-                                       prefix2iospec=remote_info.download)
+    download_io_spec = _GetRemoteIOSpec(path=PurePath(remote_path),
+                                        prefix2iospec=remote_info.download)
     return download_io_spec
   elif mode == 'upload':
-    upload_io_spec = GetRemoteIOSpec(path=remote_path,
-                                     prefix2iospec=remote_info.upload)
+    upload_io_spec = _GetRemoteIOSpec(path=PurePath(remote_path),
+                                      prefix2iospec=remote_info.upload)
     return upload_io_spec
   else:
     raise ValueError(f'Unsupported mode: {json.dumps(mode)}')
 
 
-async def DownloadTripletFile(*, triplet: ComfyUIPathTriplet,
-                              remote_info: ComfyRemoteInfo,
-                              remote: RemoteFileAPIBase,
-                              trusted_dst_path: Path):
-  download_io_spec = GetTripletFileIOSpec(triplet=triplet,
-                                          remote_info=remote_info,
-                                          mode='download')
-  await remote.DownloadFile(untrusted_src_io_spec=download_io_spec,
-                            trusted_dst_path=trusted_dst_path)
+class PreProcessorBase(ABC):
 
-
-class UserAPIInputFieldDecoderBase(ABC):
+  def Validate(self, user_input_value: JSONSerializable):
+    if not isinstance(user_input_value, JSON_SERIALIZABLE_TYPES):
+      raise ValueError('Expected user_input_value to be one of '
+                       f'{JSON_SERIALIZABLE_TYPES}, '
+                       f'got {type(user_input_value)}')
+    if not _IsJSONSerializable(user_input_value):
+      raise ValueError('Expected IsJSONSerializable(user_input_value)==True')
 
   @abstractmethod
-  async def Decode(
-      self, comfy_info: ComfyRemoteInfo,
-      comfy_api_field_type: LowdaInputFieldType,
-      user_input_encoded_value: JSONSerializable) -> JSONSerializable:
+  async def ProcessInput(
+      self, comfy_info: ComfyRemoteInfo, mapping: InputMapping,
+      user_input_value: JSONSerializable) -> JSONSerializable:
     raise NotImplementedError()
 
 
-class LiteralInputFieldDecoder(UserAPIInputFieldDecoderBase):
+class ValuePreProcessor(PreProcessorBase):
 
-  async def Decode(
-      self, comfy_info: ComfyRemoteInfo,
-      comfy_api_field_type: LowdaInputFieldType,
-      user_input_encoded_value: JSONSerializable) -> JSONSerializable:
-    if not isinstance(user_input_encoded_value, JSON_SERIALIZABLE_TYPES):
-      raise ValueError(
-          'Expected user_input_encoded_value to be one of '
-          f'{JSON_SERIALIZABLE_TYPES}, because '
-          f'LowdaInputMapping.comfy_api_field_type={json.dumps(comfy_api_field_type)}, '
-          f'got {type(user_input_encoded_value)}')
-    if not IsJSONSerializable(user_input_encoded_value):
-      raise ValueError(
-          'Expected user_input_encoded_value to be JSONSerializable, because '
-          f'LowdaInputMapping.comfy_api_field_type={json.dumps(comfy_api_field_type)}, '
-          f'got {type(user_input_encoded_value)}')
-    return user_input_encoded_value
+  async def ProcessInput(
+      self, comfy_info: ComfyRemoteInfo, mapping: InputMapping,
+      user_input_value: JSONSerializable) -> JSONSerializable:
+    self.Validate(user_input_value)
 
-
-class JSONStrInputFieldDecoder(UserAPIInputFieldDecoderBase):
-
-  async def Decode(
-      self, comfy_info: ComfyRemoteInfo,
-      comfy_api_field_type: LowdaInputFieldType,
-      user_input_encoded_value: JSONSerializable) -> JSONSerializable:
-    if not isinstance(user_input_encoded_value, (str)):
-      raise ValueError(
-          'Expected user_input_encoded_value to be str because '
-          f'LowdaInputMapping.comfy_api_field_type={repr(comfy_api_field_type)}, '
-          f'got {type(user_input_encoded_value)}')
-    user_input_value = json.loads(user_input_encoded_value)
     if not isinstance(user_input_value, JSON_SERIALIZABLE_TYPES):
-      raise AssertionError(
-          'Expected user_input_encoded_value==json.loads(user_input_encoded_value) to be one of '
-          f'{JSON_SERIALIZABLE_TYPES}, because '
-          f'LowdaInputMapping.comfy_api_field_type={repr(comfy_api_field_type)}, '
-          f'got {type(user_input_encoded_value)}')
+      raise ValueError('Expected user_input_value to be one of '
+                       f'{JSON_SERIALIZABLE_TYPES}, because '
+                       f'InputMapping.pp={json.dumps(mapping.pp)}, '
+                       f'got {type(user_input_value)}')
+    if not _IsJSONSerializable(user_input_value):
+      raise ValueError(
+          'Expected user_input_value to be JSONSerializable, because '
+          f'InputMapping.pp={json.dumps(mapping.pp)}, '
+          f'got {type(user_input_value)}')
     return user_input_value
 
 
-class UserAPIOutputFieldEncoderBase(ABC):
+class FilePreProcessor(PreProcessorBase):
+
+  def __init__(self, *, remote: RemoteFileAPIBase, tmp_dir_path: Path) -> None:
+    super().__init__()
+    self._remote = remote
+    self._tmp_dir_path = tmp_dir_path
+
+  async def ProcessInput(
+      self, comfy_info: ComfyRemoteInfo, mapping: InputMapping,
+      user_input_value: JSONSerializable) -> JSONSerializable:
+    self.Validate(user_input_value)
+
+    if mapping.pp_spec is None:
+      raise ValueError('mapping.spec is None for mapping.pp=FILE')
+    file_mapping_spec: FileUploadMapSpec = mapping.pp_spec
+
+    src_io_spec = _ParseUserIOSpec(user_input_value).ToIOSpec()
+
+    dst_io_spec: IOSpec
+    upload_to_path: PurePath
+    if isinstance(file_mapping_spec.upload_to, ComfyUIPathTriplet):
+      upload_to_path = PurePath(
+          file_mapping_spec.upload_to.ToLocalPathStr(include_folder_type=True))
+      dst_io_spec = _GetTripletFileIOSpec(triplet=file_mapping_spec.upload_to,
+                                          remote_info=comfy_info,
+                                          mode='upload')
+    else:
+      upload_to_path = PurePath(file_mapping_spec.upload_to)
+      dst_io_spec = _GetRemoteIOSpec(path=upload_to_path,
+                                     prefix2iospec=comfy_info.upload)
+
+    remote_url: str
+    if src_io_spec.io_url.startswith('data:'):
+      remote_url = await _UploadDataURI(remote=self._remote,
+                                        src_uri=src_io_spec.io_url,
+                                        untrusted_dst_io_spec=dst_io_spec,
+                                        tmp_dir_path=self._tmp_dir_path)
+    else:
+      remote_url = await self._remote.CopyFile(
+          untrusted_src_io_spec=src_io_spec, untrusted_dst_io_spec=dst_io_spec)
+
+    remote_filename = PurePath(urlparse(remote_url).path).name
+    uploaded_to_path = upload_to_path.with_name(remote_filename)
+
+    if file_mapping_spec.node_mode == 'FILEPATH':
+      # TODO: Might need to do something different here for windows.
+      uploaded_to_path_str = uploaded_to_path.as_posix()
+      return _DiscardPrefix(uploaded_to_path_str,
+                            file_mapping_spec.discard_prefix)
+    elif file_mapping_spec.node_mode == 'TRIPLET':
+      dst_triplet: ComfyUIPathTriplet = _PathToTriplet(upload_to_path)
+      return dst_triplet.model_dump(mode='json', round_trip=True)
+    else:
+      raise ValueError(f'Unsupported node_mode: {file_mapping_spec.node_mode}')
+
+
+class PostProcessorBase(ABC):
 
   @abstractmethod
-  async def Encode(self, comfy_info: ComfyRemoteInfo,
-                   comfy_api_field_type: LowdaOutputFieldType,
-                   user_output_value: JSONSerializable) -> JSONSerializable:
+  async def ProcessOutput(
+      self, comfy_info: ComfyRemoteInfo, mapping: OutputMapping,
+      user_input_value: JSONSerializable,
+      node_output_value: JSONSerializable) -> JSONSerializable:
     raise NotImplementedError()
 
-  def Validate(self, user_output_value: JSONSerializable):
-    if not isinstance(user_output_value, JSON_SERIALIZABLE_TYPES):
-      raise ValueError('Expected user_output_value to be one of '
+  def Validate(self, *, user_input_value: JSONSerializable,
+               node_output_value: JSONSerializable):
+    if not isinstance(user_input_value, JSON_SERIALIZABLE_TYPES):
+      raise ValueError('Expected user_input_value to be one of '
                        f'{JSON_SERIALIZABLE_TYPES}, '
-                       f'got {type(user_output_value)}')
-    if not IsJSONSerializable(user_output_value):
+                       f'got {type(user_input_value)}')
+    if not _IsJSONSerializable(user_input_value):
       raise ValueError('Expected IsJSONSerializable(user_output_value)==True')
+    if not isinstance(node_output_value, JSON_SERIALIZABLE_TYPES):
+      raise ValueError('Expected node_output_value to be one of '
+                       f'{JSON_SERIALIZABLE_TYPES}, '
+                       f'got {type(node_output_value)}')
+    if not _IsJSONSerializable(node_output_value):
+      raise ValueError('Expected IsJSONSerializable(node_output_value)==True')
 
 
-class LiteralOutputFieldEncoder(UserAPIOutputFieldEncoderBase):
+class ValuePostProcessor(PostProcessorBase):
 
-  async def Encode(self, comfy_info: ComfyRemoteInfo,
-                   comfy_api_field_type: LowdaOutputFieldType,
-                   user_output_value: JSONSerializable) -> JSONSerializable:
-    self.Validate(user_output_value)
-    return user_output_value
-
-
-class JSONStrOutputFieldEncoder(UserAPIOutputFieldEncoderBase):
-
-  async def Encode(self, comfy_info: ComfyRemoteInfo,
-                   comfy_api_field_type: LowdaOutputFieldType,
-                   user_output_value: JSONSerializable) -> JSONSerializable:
-    self.Validate(user_output_value)
-    return json.dumps(user_output_value)
+  async def ProcessOutput(
+      self, comfy_info: ComfyRemoteInfo, mapping: OutputMapping,
+      user_input_value: JSONSerializable,
+      node_output_value: JSONSerializable) -> JSONSerializable:
+    self.Validate(user_input_value=user_input_value,
+                  node_output_value=node_output_value)
+    return user_input_value
 
 
-class TripletB64OutputFieldEncoder(UserAPIOutputFieldEncoderBase):
+class FilePostProcessor(PostProcessorBase):
 
   def __init__(self, *, remote: RemoteFileAPIBase, tmp_dir_path: Path):
     self._remote = remote
     self._tmp_dir_path = tmp_dir_path
 
-  async def Encode(self, comfy_info: ComfyRemoteInfo,
-                   comfy_api_field_type: LowdaOutputFieldType,
-                   user_output_value: JSONSerializable) -> JSONSerializable:
-    self.Validate(user_output_value)
-    triplet = ComfyUIPathTriplet.model_validate(user_output_value)
-    download_io_spec = GetTripletFileIOSpec(triplet=triplet,
-                                            remote_info=comfy_info,
-                                            mode='download')
-    return await DownloadURLToB64(remote=self._remote,
-                                  io_spec=download_io_spec,
-                                  tmp_dir_path=self._tmp_dir_path)
+  async def ProcessOutput(
+      self, comfy_info: ComfyRemoteInfo, mapping: OutputMapping,
+      user_input_value: JSONSerializable,
+      node_output_value: JSONSerializable) -> JSONSerializable:
+    self.Validate(user_input_value=user_input_value,
+                  node_output_value=node_output_value)
+    triplet = ComfyUIPathTriplet.model_validate(node_output_value)
+    download_io_spec = _GetTripletFileIOSpec(triplet=triplet,
+                                             remote_info=comfy_info,
+                                             mode='download')
+
+    dst_user_io_spec = _ParseUserIOSpec(user_input_value)
+    if dst_user_io_spec.root == 'base64':
+      return await _DownloadURLToB64(remote=self._remote,
+                                     io_spec=download_io_spec,
+                                     tmp_dir_path=self._tmp_dir_path)
+    dst_io_spec = dst_user_io_spec.ToIOSpec()
+    return await self._remote.CopyFile(untrusted_src_io_spec=download_io_spec,
+                                       untrusted_dst_io_spec=dst_io_spec)
+
+
+def _GetInputValue(mapping: InputMapping | OutputMapping,
+                   user_input_values: Dict[str, JSONSerializable],
+                   error_context: _ErrorContext) -> JSONSerializable:
+  if mapping.user_json_spec == 'NO_PUBLIC_INPUT':
+    if mapping.name in user_input_values:
+      raise ValueError(
+          f'input_mapping.name={json.dumps(mapping.name)} provided by the user, but input_mapping.user_json_spec={json.dumps(mapping.user_json_spec)}'
+      )
+    return mapping.user_value
+  elif mapping.user_json_spec == 'OPT_ANY':
+    return user_input_values.get(mapping.name, mapping.user_value)
+  else:
+    if mapping.name not in user_input_values:
+      raise ValueError(
+          f'input_mapping.name={json.dumps(mapping.name)}'
+          f' provided by the user not in user_input_values {json.dumps(list(user_input_values.keys()))}'
+          f'\n\n{textwrap.indent(YamlDump(error_context.Dump()), "  ")}')
+    value = user_input_values[mapping.name]
+    if mapping.user_json_spec == 'ANY':
+      return value
+    jsonschema.validate(
+        instance=value,
+        schema=mapping.user_json_spec,
+        format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 
 
 class Manager(ManagerBase):
@@ -771,24 +982,17 @@ class Manager(ManagerBase):
     self._provisioner = provisioner
     self._remote = remote
     self._tmp_dir_path = tmp_dir_path
-    self._input_value_decoders: Dict[LowdaInputFieldType,
-                                     UserAPIInputFieldDecoderBase] = {}
-    self._output_value_encoders: Dict[LowdaOutputFieldType,
-                                      UserAPIOutputFieldEncoderBase] = {}
+    self._input_processors: Dict[InputPPKind, PreProcessorBase] = {}
+    self._post_processors: Dict[OutputPPKind, PostProcessorBase] = {}
     self._debug_path: Path = debug_path
     self._debug_save_all = debug_save_all
 
-    self._input_value_decoders[
-        LowdaInputFieldType.LITERAL] = LiteralInputFieldDecoder()
-    self._input_value_decoders[
-        LowdaInputFieldType.JSON_STR] = JSONStrInputFieldDecoder()
-    self._output_value_encoders[
-        LowdaOutputFieldType.LITERAL] = LiteralOutputFieldEncoder()
-    self._output_value_encoders[
-        LowdaOutputFieldType.JSON_STR] = JSONStrOutputFieldEncoder()
-    self._output_value_encoders[
-        LowdaOutputFieldType.TRIPLET_FILE_B64] = TripletB64OutputFieldEncoder(
-            remote=self._remote, tmp_dir_path=self._tmp_dir_path)
+    self._input_processors[InputPPKind.VALUE] = ValuePreProcessor()
+    self._input_processors[InputPPKind.FILE] = FilePreProcessor(
+        remote=remote, tmp_dir_path=tmp_dir_path)
+    self._post_processors[OutputPPKind.NODE_VALUE] = ValuePostProcessor()
+    self._post_processors[OutputPPKind.FILE] = FilePostProcessor(
+        remote=self._remote, tmp_dir_path=self._tmp_dir_path)
 
   async def _KeepAlive(self, job_id: str, keepalive: float) -> None:
     try:
@@ -808,135 +1012,180 @@ class Manager(ManagerBase):
   async def _UploadValue(self, comfy_info: ComfyRemoteInfo,
                          workflow: WorkflowBundle,
                          prepared_workflow: APIWorkflow,
-                         user_input_mapping: LowdaInputMapping,
-                         user_input_encoded_value: JSONSerializable) -> None:
+                         input_mapping: InputMapping,
+                         user_input_value: JSONSerializable) -> None:
     node_id: APINodeID
-    node_id, _, _ = FindNode(
+    node_id, _, _ = _FindNode(
         workflow=workflow.template_bundle.workflow_template,
-        node_id_or_name=user_input_mapping.node)
-    comfy_api_field_type: LowdaInputFieldType = user_input_mapping.comfy_api_field_type
+        node_id_or_name=input_mapping.node)
+    pp: InputPPKind = input_mapping.pp
     if node_id not in prepared_workflow.root:
       raise ValueError(f'{node_id} not in prepared_workflow.root')
-    if comfy_api_field_type not in self._input_value_decoders:
-      raise ValueError(
-          f'comfy_api_field_type={comfy_api_field_type} not in self._input_value_decoders'
-      )
-    decoder = self._input_value_decoders[comfy_api_field_type]
-    user_input_value: JSONSerializable
-    user_input_value = await decoder.Decode(
+    node: APIWorkflowNodeInfo = prepared_workflow.root[node_id]
+    if pp not in self._input_processors:
+      raise ValueError(f'pp={pp} not in self._input_processors')
+    processor = self._input_processors[pp]
+    user_input_value_pp: JSONSerializable
+    user_input_value_pp = await processor.ProcessInput(
         comfy_info=comfy_info,
-        comfy_api_field_type=comfy_api_field_type,
-        user_input_encoded_value=user_input_encoded_value)
+        mapping=input_mapping,
+        user_input_value=user_input_value)
     # TODO: Ensure that this field path exists.
-    pydash.set_(prepared_workflow.root, user_input_mapping.comfy_api_field_path,
-                user_input_value)
+    pydash.set_(node.inputs, input_mapping.field, user_input_value_pp)
 
   async def _UploadValues(self, comfy_info: ComfyRemoteInfo,
                           workflow: WorkflowBundle,
-                          prepared_workflow: APIWorkflow) -> None:
-    user_input_mappings: Dict[str, LowdaInputMapping]
-    user_input_mappings = workflow.template_bundle.user_input_mappings
-    user_input_values = workflow.user_input_values
-    for user_input_name, user_input_mapping in user_input_mappings.items():
-      try:
-        user_input_encoded_value = user_input_values[user_input_name]
+                          prepared_workflow: APIWorkflow,
+                          error_context: _ErrorContext) -> None:
+    input_mappings: List[InputMapping]
+    input_mappings = workflow.template_bundle.input_mappings
 
-        await self._UploadValue(
-            comfy_info=comfy_info,
-            workflow=workflow,
-            prepared_workflow=prepared_workflow,
-            user_input_mapping=user_input_mapping,
-            user_input_encoded_value=user_input_encoded_value)
+    error_context['input_mappings'] = [
+        m.model_dump(mode='json', round_trip=True) for m in input_mappings
+    ]
+    user_input_values = workflow.user_input_values
+    error_context['user_input_values'] = user_input_values
+    for input_mapping in input_mappings:
+      error_context['input_mapping'] = input_mapping.model_dump(mode='json',
+                                                                round_trip=True)
+      try:
+
+        user_input_value = _GetInputValue(input_mapping, user_input_values,
+                                          error_context)
+        error_context['user_input_value'] = user_input_value
+
+        await self._UploadValue(comfy_info=comfy_info,
+                                workflow=workflow,
+                                prepared_workflow=prepared_workflow,
+                                input_mapping=input_mapping,
+                                user_input_value=user_input_value)
       except Exception as e:
         logger.exception('UploadValue failed',
                          exc_info=True,
                          stack_info=True,
-                         extra={
-                             'user_input_name': user_input_name,
-                             'user_input_mapping': user_input_mapping,
-                             'user_input_encoded_value':
-                             user_input_encoded_value
-                         })
+                         extra=error_context.Dump())
         raise ValueError(
-            f'Failed to upload {json.dumps(user_input_name)}={json.dumps(user_input_encoded_value)}'
+            f'Failed to upload {json.dumps(input_mapping.name)}'
+            f'\n\n{textwrap.indent(YamlDump(error_context.Dump()), "  ")}'
         ) from e
 
-  async def _DownloadValue(
-      self, comfy_info: ComfyRemoteInfo, workflow: WorkflowBundle,
-      prepared_workflow: APIWorkflow, history: APIHistoryEntry,
-      user_output_mapping: LowdaOutputMapping) -> JSONSerializable:
+  async def _DownloadValue(self, comfy_info: ComfyRemoteInfo,
+                           workflow: WorkflowBundle,
+                           prepared_workflow: APIWorkflow,
+                           history: APIHistoryEntry,
+                           output_mapping: OutputMapping,
+                           error_context: _ErrorContext) -> JSONSerializable:
+    # TODO: Wrap this in a try-catch and throw a specific error for this input.
     node_id: APINodeID
-    node_id, _, _ = FindNode(
+    node_id, _, _ = _FindNode(
         workflow=workflow.template_bundle.workflow_template,
-        node_id_or_name=user_output_mapping.node)
-    comfy_api_field_type: LowdaOutputFieldType = user_output_mapping.comfy_api_field_type
+        node_id_or_name=output_mapping.node)
+    pp: OutputPPKind = output_mapping.pp
     if history.outputs is None or node_id not in history.outputs:
       raise ValueError(f'{node_id} not in history.outputs')
 
     node_outputs: APIOutputUI = history.outputs[node_id]
-    user_output_value: JSONSerializable
-    user_output_value_any: Any = pydash.get(
-        node_outputs.root, user_output_mapping.comfy_api_field_path)
+    node_output_value: JSONSerializable
+    node_output_value_any: Any = pydash.get(node_outputs.root,
+                                            output_mapping.field)
 
-    if not isinstance(user_output_value_any, JSON_SERIALIZABLE_TYPES):
+    if not isinstance(node_output_value_any, JSON_SERIALIZABLE_TYPES):
       raise ValueError(
-          f'Expected user_output_value to be one of {JSON_SERIALIZABLE_TYPES}, got {type(user_output_value_any)}'
+          f'Expected node_output_value to be one of {JSON_SERIALIZABLE_TYPES}, got {type(node_output_value_any)}'
       )
-    if not IsJSONSerializable(user_output_value_any):
+    if not _IsJSONSerializable(node_output_value_any):
       raise ValueError(
-          f'Expected user_output_value to be JSONSerializable, got {type(user_output_value_any)}'
+          f'Expected node_output_value to be JSONSerializable, got {type(node_output_value_any)}'
       )
-    user_output_value = user_output_value_any
-    if comfy_api_field_type not in self._output_value_encoders:
-      raise ValueError(
-          f'comfy_api_field_type={comfy_api_field_type} not in self._output_value_encoders'
-      )
-    encoder = self._output_value_encoders[comfy_api_field_type]
-    return await encoder.Encode(comfy_info=comfy_info,
-                                comfy_api_field_type=comfy_api_field_type,
-                                user_output_value=user_output_value)
+    node_output_value = node_output_value_any
+    if pp not in self._post_processors:
+      raise ValueError(f'pp={pp} not in self._output_processors')
+    processor = self._post_processors[pp]
+    user_input_value: JSONSerializable
+    user_input_value = _GetInputValue(
+        output_mapping,
+        user_input_values=workflow.user_input_values,
+        error_context=error_context.Copy())
+    return await processor.ProcessOutput(comfy_info=comfy_info,
+                                         mapping=output_mapping,
+                                         user_input_value=user_input_value,
+                                         node_output_value=node_output_value)
 
   async def _DownloadValues(
       self, comfy_info: ComfyRemoteInfo, workflow: WorkflowBundle,
-      prepared_workflow: APIWorkflow,
-      history: APIHistoryEntry) -> Dict[str, JSONSerializable]:
+      prepared_workflow: APIWorkflow, history: APIHistoryEntry,
+      error_context: _ErrorContext) -> Dict[str, JSONSerializable]:
     user_output_values: Dict[str, JSONSerializable] = {}
+    error_context['user_output_values'] = user_output_values
 
-    user_output_name: str
-    user_output_mapping: LowdaOutputMapping
-    for user_output_name, user_output_mapping in workflow.template_bundle.user_output_mappings.items(
-    ):
+    output_mapping: OutputMapping
+    for output_mapping in workflow.template_bundle.output_mappings:
+      error_context['user_output_name'] = output_mapping.name
       try:
-        user_output_values[user_output_name] = await self._DownloadValue(
-            comfy_info=comfy_info,
-            workflow=workflow,
-            prepared_workflow=prepared_workflow,
-            history=history,
-            user_output_mapping=user_output_mapping,
-        )
+        if output_mapping.name in user_output_values:
+          raise ValueError(
+              f'output_mapping.name={json.dumps(output_mapping.name)} already in user_output_values'
+          )
+        error_context['output_mapping'] = output_mapping.model_dump(
+            mode='json', round_trip=True)
+        value = await self._DownloadValue(comfy_info=comfy_info,
+                                          workflow=workflow,
+                                          prepared_workflow=prepared_workflow,
+                                          history=history,
+                                          output_mapping=output_mapping,
+                                          error_context=error_context.Copy())
+        user_output_values[output_mapping.name] = value
+        logging.info('DownloadValue succeeded', extra=error_context.Dump())
       except Exception as e:
         logger.exception('DownloadValue failed',
                          exc_info=True,
                          stack_info=True,
-                         extra={
-                             'user_output_name': user_output_name,
-                             'user_output_mapping': user_output_mapping
-                         })
+                         extra=error_context.Dump())
         raise ValueError(
-            f'Failed to download {json.dumps(user_output_name)}') from e
+            f'Failed to download {json.dumps(output_mapping.name)}'
+            f'\n\n{textwrap.indent(YamlDump(error_context.Dump()), "  ")})'
+        ) from e
 
     return user_output_values
 
   async def _Execute(self, req: ExecuteReq) -> ExecuteRes:
-    ProvisionReq = ProvisionerBase.ProvisionReq
+    error_context = _ErrorContext(debug_path=self._debug_path, key=req.job_id)
+    error_context['req'] = await error_context.LargeToFile(
+        'req', req.model_dump(mode='json', round_trip=True))
+    error_context['provisioning'] = req.provisioning.model_dump(mode='json',
+                                                                round_trip=True)
+    error_context['keepalive'] = req.keepalive
+    error_context['workflow'] = await error_context.LargeToFile(
+        'workflow', req.workflow.model_dump(mode='json', round_trip=True))
+    error_context['template_bundle'] = await error_context.LargeToFile(
+        'template_bundle',
+        req.workflow.template_bundle.model_dump(mode='json', round_trip=True))
+    error_context['user_input_values'] = await error_context.LargeToFile(
+        'user_input_values', req.workflow.user_input_values)
 
+    logger.info('Manager.Execute() was called', extra=error_context.Dump())
+
+    ############################################################################
+    if slugify(req.job_id) != req.job_id:
+      raise ValueError(f'job_id must be slugified: {req.job_id}')
+
+    job_debug_path = self._debug_path / f'{slugify(datetime.now().isoformat())}_{req.job_id}'
+    await job_debug_path.mkdir(parents=True, exist_ok=True)
+    ############################################################################
+    ProvisionReq = ProvisionerBase.ProvisionReq
     provisioned: ProvisionerBase.ProvisionRes
     provisioned = await self._provisioner.Provision(
         ProvisionReq(id=req.job_id,
                      bundle=req.provisioning,
                      keepalive=req.keepalive))
+    error_context['provisioned'] = provisioned.model_dump(mode='json',
+                                                          round_trip=True)
+    logger.info('Successfully provisioned a ComfyUI instance',
+                extra=error_context.Dump())
+    ############################################################################
     keepalive_task = asyncio.create_task(
         self._KeepAlive(req.job_id, req.keepalive))
+    ############################################################################
 
     try:
       async with ComfyAPIClient(
@@ -948,23 +1197,44 @@ class Manager(ManagerBase):
           api_workflow_template = req.workflow.template_bundle.api_workflow_template
           prepared_workflow = api_workflow_template.model_copy(deep=True)
 
+          ######################################################################
           await self._UploadValues(comfy_info=provisioned.comfy_info,
                                    workflow=req.workflow,
-                                   prepared_workflow=prepared_workflow)
+                                   prepared_workflow=prepared_workflow,
+                                   error_context=error_context.Copy())
+          error_context['prepared_workflow'] = await error_context.LargeToFile(
+              'prepared_workflow',
+              prepared_workflow.model_dump(mode='json', round_trip=True))
+          logger.info('Uploaded all user input values',
+                      extra=error_context.Dump())
+          ######################################################################
+
           history_dict = await catapult.Catapult(
               job_id=req.job_id,
-              prepared_workflow=prepared_workflow.model_dump(),
-              important=req.workflow.template_bundle.important)
+              prepared_workflow=prepared_workflow.model_dump(mode='json',
+                                                             round_trip=True),
+              important=req.workflow.template_bundle.important,
+              job_debug_path=job_debug_path)
+          error_context['history_dict'] = await error_context.LargeToFile(
+              'history_dict', history_dict)
           history: APIHistoryEntry = APIHistoryEntry.model_validate(
               history_dict)
-
+          error_context['history'] = await error_context.LargeToFile(
+              'history', history.model_dump(mode='json', round_trip=True))
+          logger.info('Catapulted the job', extra=error_context.Dump())
+          ######################################################################
           mapped_outputs: Dict[str, JSONSerializable]
           mapped_outputs = await self._DownloadValues(
               comfy_info=provisioned.comfy_info,
               workflow=req.workflow,
               prepared_workflow=prepared_workflow,
-              history=history)
-
+              history=history,
+              error_context=error_context.Copy())
+          error_context['mapped_outputs'] = await error_context.LargeToFile(
+              'mapped_outputs', mapped_outputs)
+          logger.info('Downloaded all user output values',
+                      extra=error_context.Dump())
+          ######################################################################
           return self.ExecuteRes(job_id=req.job_id,
                                  history=history,
                                  mapped_outputs=mapped_outputs)
