@@ -18,6 +18,7 @@ from anyio import Path
 from comfy_catapult.comfy_schema import APIObjectInfo, APIWorkflow
 from pydantic import BaseModel, Field
 from rich.console import Console
+from rich_argparse import RichHelpFormatter  # type: ignore[import]
 from slugify import slugify
 
 from .comfy_schema import Workflow
@@ -35,7 +36,8 @@ async def amain():
   try:
     RegisterComfyUIFS()
 
-    parser = argparse.ArgumentParser(description='Comfylowda')
+    parser = argparse.ArgumentParser(description='Comfylowda',
+                                     formatter_class=RichHelpFormatter)
     parser.add_argument('--workflow',
                         type=Path,
                         required=True,
