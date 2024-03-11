@@ -21,9 +21,9 @@ from slugify import slugify
 from .comfyfs import RegisterComfyUIFS
 from .lowda import (APIObjectInfo, APIWorkflow, ComfyRemoteInfo,
                     DumbProvisioner, FileDownloadMapSpec, FSSpecRemoteFileAPI,
-                    InputMapping, InputPPKind, IOSpec, Manager, ManagerBase,
-                    OutputMapping, OutputPPKind, ProvisioningBundle, Workflow,
-                    WorkflowBundle, WorkflowTemplateBundle, YamlDump)
+                    InputMapping, InputPPKind, IOSpec, OutputMapping,
+                    OutputPPKind, ProvisioningBundle, Server, Workflow,
+                    WorkflowTemplateBundle, YamlDump)
 
 
 class JSONFormatter(logging.Formatter):
@@ -108,11 +108,11 @@ async def amain():
                  fs=fsspec.filesystem('file'),
                  mode='w')
 
-    manager = Manager(provisioner=provisioner,
-                      remote=remote,
-                      tmp_dir_path=tmp_dir_path,
-                      debug_path=debug_path,
-                      debug_save_all=True)
+    manager = Server(provisioner=provisioner,
+                     remote=remote,
+                     tmp_dir_path=tmp_dir_path,
+                     debug_path=debug_path,
+                     debug_save_all=True)
 
     provisioning = ProvisioningBundle(
         archives={},
@@ -160,6 +160,7 @@ async def amain():
                           user_json_spec='ANY',
                           user_value=None),
         ])
+    workflow_id = slugify(uuid.uuid4().hex)
 
     await local_download_path.mkdir(parents=True, exist_ok=True)
     download_io_specs = [
@@ -168,19 +169,27 @@ async def amain():
                        'done2.png').as_uri()).model_dump(mode='json')
     ]
     for download_io_spec in download_io_specs:
-      workflow = WorkflowBundle(template_bundle=template_bundle,
-                                user_input_values={
-                                    'width': 512,
-                                    'height': 512,
-                                    'Preview Image': download_io_spec
-                                })
-      res: ManagerBase.ExecuteRes
-      res = await manager.Execute(
-          Manager.ExecuteReq(job_id=job_id,
-                             workflow=workflow,
-                             provisioning=provisioning,
-                             keepalive=60))
+      user_input_values = {
+          'width': 512,
+          'height': 512,
+          'Preview Image': download_io_spec
+      }
+      ##########################################################################
+      res: Server.UploadWorkflowRes
+      res = await manager.UploadWorkflow(
+          Server.UploadWorkflowReq(workflow_id=workflow_id,
+                                   template_bundle=template_bundle,
+                                   provisioning=provisioning,
+                                   keepalive=60.))
       console.print(res)
+      ##########################################################################
+      exec_res: Server.ExecuteRes
+      exec_res = await manager.Execute(
+          Server.ExecuteReq(job_id=job_id,
+                            workflow_id=workflow_id,
+                            user_input_values=user_input_values))
+      console.print(exec_res)
+      ##########################################################################
   except Exception as e:
     console.print_exception()
     raise e

@@ -11,6 +11,7 @@ import json
 import os
 import sys
 import uuid
+from hashlib import sha256
 from typing import List, Literal
 
 import fsspec
@@ -25,9 +26,9 @@ from .comfy_schema import Workflow
 from .comfyfs import RegisterComfyUIFS
 from .lowda import (ComfyRemoteInfo, DumbProvisioner, FileDownloadMapSpec,
                     FileUploadMapSpec, FSSpecRemoteFileAPI, InputMapping,
-                    InputPPKind, IOSpec, Manager, ManagerBase, OutputMapping,
-                    OutputPPKind, ProvisioningBundle, UserIOSpec,
-                    WorkflowBundle, WorkflowTemplateBundle)
+                    InputPPKind, IOSpec, OutputMapping, OutputPPKind,
+                    ProvisioningBundle, Server, ServerBase, UserIOSpec,
+                    WorkflowTemplateBundle)
 
 
 async def amain():
@@ -38,6 +39,7 @@ async def amain():
 
     parser = argparse.ArgumentParser(description='Comfylowda',
                                      formatter_class=RichHelpFormatter)
+
     parser.add_argument('--workflow',
                         type=Path,
                         required=True,
@@ -181,11 +183,11 @@ async def amain():
                    fs=fsspec.filesystem(fs_arg.protocol),
                    mode=fs_arg.mode)
     ############################################################################
-    manager = Manager(provisioner=provisioner,
-                      remote=remote,
-                      tmp_dir_path=tmp_dir_path,
-                      debug_path=debug_path,
-                      debug_save_all=debug_save_all)
+    manager = Server(provisioner=provisioner,
+                     remote=remote,
+                     tmp_dir_path=tmp_dir_path,
+                     debug_path=debug_path,
+                     debug_save_all=debug_save_all)
 
     provisioning = ProvisioningBundle(
         archives={},
@@ -221,16 +223,23 @@ async def amain():
         object_info=object_info,
         input_mappings=input_mappings,
         output_mappings=output_mappings)
+    workflow_id = sha256(
+        template_bundle.model_dump_json().encode('utf-8')).hexdigest()
+    ############################################################################
 
-    workflow = WorkflowBundle(template_bundle=template_bundle,
-                              user_input_values=user_input_values)
-    res: ManagerBase.ExecuteRes
-    res = await manager.Execute(
-        Manager.ExecuteReq(job_id=job_id,
-                           workflow=workflow,
-                           provisioning=provisioning,
-                           keepalive=keepalive_timeout))
+    res: ServerBase.UploadWorkflowRes
+    res = await manager.UploadWorkflow(
+        ServerBase.UploadWorkflowReq(workflow_id=workflow_id,
+                                     template_bundle=template_bundle,
+                                     provisioning=provisioning,
+                                     keepalive=keepalive_timeout))
     console.print(res)
+    exec_res: ServerBase.ExecuteRes
+    exec_res = await manager.Execute(
+        ServerBase.ExecuteReq(job_id=job_id,
+                              workflow_id=workflow_id,
+                              user_input_values=user_input_values))
+    console.print(exec_res)
   except Exception:
     console.print_exception()
     console.print('Failed to execute the workflow. Exiting.', style='red')

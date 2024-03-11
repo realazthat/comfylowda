@@ -688,11 +688,6 @@ class WorkflowTemplateBundle(BaseModel):
   output_mappings: List[OutputMapping]
 
 
-class WorkflowBundle(BaseModel):
-  template_bundle: WorkflowTemplateBundle
-  user_input_values: Dict[str, JSONSerializable]
-
-
 class ProvisionerBase(ABC):
 
   class ProvisionReq(BaseModel):
@@ -736,26 +731,34 @@ class DumbProvisioner(ProvisionerBase):
     return ProvisionerBase.TouchRes(success=True, message='')
 
 
-class ManagerBase(ABC):
+class ServerBase(ABC):
+
+  class UploadWorkflowReq(BaseModel):
+    workflow_id: str
+    template_bundle: WorkflowTemplateBundle
+    provisioning: ProvisioningBundle
+    keepalive: float
+
+  class UploadWorkflowRes(BaseModel):
+    pass
+
+  @abstractmethod
+  async def UploadWorkflow(self, req: UploadWorkflowReq) -> UploadWorkflowRes:
+    raise NotImplementedError()
 
   class ExecuteReq(BaseModel):
     job_id: str
-
-    @pydantic.field_validator('job_id')
-    @classmethod
-    def check_slugified(cls, v):
-      if slugify(v) != v:
-        raise ValueError('job_id must be slugified; use python-slugify')
-      return v
-
-    workflow: WorkflowBundle
-    provisioning: ProvisioningBundle
-    keepalive: float
+    workflow_id: str
+    user_input_values: Dict[str, JSONSerializable]
 
   class ExecuteRes(BaseModel):
     job_id: str
     history: APIHistoryEntry
     mapped_outputs: Dict[str, JSONSerializable]
+
+  @abstractmethod
+  async def Execute(self, req: ExecuteReq) -> ExecuteRes:
+    raise NotImplementedError()
 
   class TouchReq(BaseModel):
     job_id: str
@@ -764,10 +767,6 @@ class ManagerBase(ABC):
   class TouchRes(BaseModel):
     success: bool
     message: str
-
-  @abstractmethod
-  async def Execute(self, req: ExecuteReq) -> ExecuteRes:
-    raise NotImplementedError()
 
   @abstractmethod
   async def Touch(self, req: TouchReq) -> TouchRes:
@@ -972,9 +971,14 @@ def _GetInputValue(mapping: InputMapping | OutputMapping,
         format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 
 
-class Manager(ManagerBase):
-  ExecuteReq = ManagerBase.ExecuteReq
-  ExecuteRes = ManagerBase.ExecuteRes
+class Server(ServerBase):
+  UploadWorkflowReq = ServerBase.UploadWorkflowReq
+  UploadWorkflowRes = ServerBase.UploadWorkflowRes
+  ExecuteReq = ServerBase.ExecuteReq
+  ExecuteRes = ServerBase.ExecuteRes
+
+  TouchReq = ServerBase.TouchReq
+  TouchRes = ServerBase.TouchRes
 
   def __init__(self, *, provisioner: ProvisionerBase, remote: RemoteFileAPIBase,
                tmp_dir_path: Path, debug_path: Path,
@@ -994,6 +998,13 @@ class Manager(ManagerBase):
     self._post_processors[OutputPPKind.FILE] = FilePostProcessor(
         remote=self._remote, tmp_dir_path=self._tmp_dir_path)
 
+    self._workflows: Dict[str, ServerBase.UploadWorkflowReq] = {}
+
+  async def UploadWorkflow(
+      self, req: ServerBase.UploadWorkflowReq) -> ServerBase.UploadWorkflowRes:
+    self._workflows[req.workflow_id] = req
+    return ServerBase.UploadWorkflowRes()
+
   async def _KeepAlive(self, job_id: str, keepalive: float) -> None:
     try:
       while True:
@@ -1010,18 +1021,17 @@ class Manager(ManagerBase):
                        })
 
   async def _UploadValue(self, comfy_info: ComfyRemoteInfo,
-                         workflow: WorkflowBundle,
-                         prepared_workflow: APIWorkflow,
+                         workflow_template: Workflow,
+                         prepared_api_workflow: APIWorkflow,
                          input_mapping: InputMapping,
                          user_input_value: JSONSerializable) -> None:
     node_id: APINodeID
-    node_id, _, _ = _FindNode(
-        workflow=workflow.template_bundle.workflow_template,
-        node_id_or_name=input_mapping.node)
+    node_id, _, _ = _FindNode(workflow=workflow_template,
+                              node_id_or_name=input_mapping.node)
     pp: InputPPKind = input_mapping.pp
-    if node_id not in prepared_workflow.root:
+    if node_id not in prepared_api_workflow.root:
       raise ValueError(f'{node_id} not in prepared_workflow.root')
-    node: APIWorkflowNodeInfo = prepared_workflow.root[node_id]
+    node: APIWorkflowNodeInfo = prepared_api_workflow.root[node_id]
     if pp not in self._input_processors:
       raise ValueError(f'pp={pp} not in self._input_processors')
     processor = self._input_processors[pp]
@@ -1034,16 +1044,15 @@ class Manager(ManagerBase):
     pydash.set_(node.inputs, input_mapping.field, user_input_value_pp)
 
   async def _UploadValues(self, comfy_info: ComfyRemoteInfo,
-                          workflow: WorkflowBundle,
-                          prepared_workflow: APIWorkflow,
+                          workflow_template: Workflow,
+                          prepared_api_workflow: APIWorkflow,
+                          input_mappings: List[InputMapping],
+                          user_input_values: Dict[str, JSONSerializable],
                           error_context: _ErrorContext) -> None:
-    input_mappings: List[InputMapping]
-    input_mappings = workflow.template_bundle.input_mappings
 
     error_context['input_mappings'] = [
         m.model_dump(mode='json', round_trip=True) for m in input_mappings
     ]
-    user_input_values = workflow.user_input_values
     error_context['user_input_values'] = user_input_values
     for input_mapping in input_mappings:
       error_context['input_mapping'] = input_mapping.model_dump(mode='json',
@@ -1055,8 +1064,8 @@ class Manager(ManagerBase):
         error_context['user_input_value'] = user_input_value
 
         await self._UploadValue(comfy_info=comfy_info,
-                                workflow=workflow,
-                                prepared_workflow=prepared_workflow,
+                                workflow_template=workflow_template,
+                                prepared_api_workflow=prepared_api_workflow,
                                 input_mapping=input_mapping,
                                 user_input_value=user_input_value)
       except Exception as e:
@@ -1070,16 +1079,16 @@ class Manager(ManagerBase):
         ) from e
 
   async def _DownloadValue(self, comfy_info: ComfyRemoteInfo,
-                           workflow: WorkflowBundle,
-                           prepared_workflow: APIWorkflow,
+                           workflow_template: Workflow,
+                           prepared_api_workflow: APIWorkflow,
                            history: APIHistoryEntry,
                            output_mapping: OutputMapping,
+                           user_input_values: Dict[str, JSONSerializable],
                            error_context: _ErrorContext) -> JSONSerializable:
     # TODO: Wrap this in a try-catch and throw a specific error for this input.
     node_id: APINodeID
-    node_id, _, _ = _FindNode(
-        workflow=workflow.template_bundle.workflow_template,
-        node_id_or_name=output_mapping.node)
+    node_id, _, _ = _FindNode(workflow=workflow_template,
+                              node_id_or_name=output_mapping.node)
     pp: OutputPPKind = output_mapping.pp
     if history.outputs is None or node_id not in history.outputs:
       raise ValueError(f'{node_id} not in history.outputs')
@@ -1102,24 +1111,24 @@ class Manager(ManagerBase):
       raise ValueError(f'pp={pp} not in self._output_processors')
     processor = self._post_processors[pp]
     user_input_value: JSONSerializable
-    user_input_value = _GetInputValue(
-        output_mapping,
-        user_input_values=workflow.user_input_values,
-        error_context=error_context.Copy())
+    user_input_value = _GetInputValue(output_mapping,
+                                      user_input_values=user_input_values,
+                                      error_context=error_context.Copy())
     return await processor.ProcessOutput(comfy_info=comfy_info,
                                          mapping=output_mapping,
                                          user_input_value=user_input_value,
                                          node_output_value=node_output_value)
 
   async def _DownloadValues(
-      self, comfy_info: ComfyRemoteInfo, workflow: WorkflowBundle,
-      prepared_workflow: APIWorkflow, history: APIHistoryEntry,
+      self, comfy_info: ComfyRemoteInfo, workflow_template: Workflow,
+      output_mappings: List[OutputMapping], prepared_api_workflow: APIWorkflow,
+      history: APIHistoryEntry, user_input_values: Dict[str, JSONSerializable],
       error_context: _ErrorContext) -> Dict[str, JSONSerializable]:
     user_output_values: Dict[str, JSONSerializable] = {}
     error_context['user_output_values'] = user_output_values
 
     output_mapping: OutputMapping
-    for output_mapping in workflow.template_bundle.output_mappings:
+    for output_mapping in output_mappings:
       error_context['user_output_name'] = output_mapping.name
       try:
         if output_mapping.name in user_output_values:
@@ -1128,12 +1137,14 @@ class Manager(ManagerBase):
           )
         error_context['output_mapping'] = output_mapping.model_dump(
             mode='json', round_trip=True)
-        value = await self._DownloadValue(comfy_info=comfy_info,
-                                          workflow=workflow,
-                                          prepared_workflow=prepared_workflow,
-                                          history=history,
-                                          output_mapping=output_mapping,
-                                          error_context=error_context.Copy())
+        value = await self._DownloadValue(
+            comfy_info=comfy_info,
+            workflow_template=workflow_template,
+            prepared_api_workflow=prepared_api_workflow,
+            history=history,
+            output_mapping=output_mapping,
+            user_input_values=user_input_values,
+            error_context=error_context.Copy())
         user_output_values[output_mapping.name] = value
         logging.info('DownloadValue succeeded', extra=error_context.Dump())
       except Exception as e:
@@ -1149,19 +1160,21 @@ class Manager(ManagerBase):
     return user_output_values
 
   async def _Execute(self, req: ExecuteReq) -> ExecuteRes:
+    if req.workflow_id not in self._workflows:
+      raise ValueError(f'Workflow not found: {req.workflow_id}')
+    upload_req: ServerBase.UploadWorkflowReq = self._workflows[req.workflow_id]
+    provisioning: ProvisioningBundle = upload_req.provisioning
+
     error_context = _ErrorContext(debug_path=self._debug_path, key=req.job_id)
     error_context['req'] = await error_context.LargeToFile(
         'req', req.model_dump(mode='json', round_trip=True))
-    error_context['provisioning'] = req.provisioning.model_dump(mode='json',
-                                                                round_trip=True)
-    error_context['keepalive'] = req.keepalive
-    error_context['workflow'] = await error_context.LargeToFile(
-        'workflow', req.workflow.model_dump(mode='json', round_trip=True))
-    error_context['template_bundle'] = await error_context.LargeToFile(
-        'template_bundle',
-        req.workflow.template_bundle.model_dump(mode='json', round_trip=True))
+    error_context['upload_req'] = await error_context.LargeToFile(
+        'upload_req', upload_req.model_dump(mode='json', round_trip=True))
+    error_context['provisioning'] = provisioning.model_dump(mode='json',
+                                                            round_trip=True)
+    error_context['keepalive'] = upload_req.keepalive
     error_context['user_input_values'] = await error_context.LargeToFile(
-        'user_input_values', req.workflow.user_input_values)
+        'user_input_values', req.user_input_values)
 
     logger.info('Manager.Execute() was called', extra=error_context.Dump())
 
@@ -1176,15 +1189,15 @@ class Manager(ManagerBase):
     provisioned: ProvisionerBase.ProvisionRes
     provisioned = await self._provisioner.Provision(
         ProvisionReq(id=req.job_id,
-                     bundle=req.provisioning,
-                     keepalive=req.keepalive))
+                     bundle=provisioning,
+                     keepalive=upload_req.keepalive))
     error_context['provisioned'] = provisioned.model_dump(mode='json',
                                                           round_trip=True)
     logger.info('Successfully provisioned a ComfyUI instance',
                 extra=error_context.Dump())
     ############################################################################
     keepalive_task = asyncio.create_task(
-        self._KeepAlive(req.job_id, req.keepalive))
+        self._KeepAlive(req.job_id, upload_req.keepalive))
     ############################################################################
 
     try:
@@ -1194,26 +1207,29 @@ class Manager(ManagerBase):
             comfy_client=client,
             debug_path=self._debug_path,
             debug_save_all=self._debug_save_all) as catapult:
-          api_workflow_template = req.workflow.template_bundle.api_workflow_template
-          prepared_workflow = api_workflow_template.model_copy(deep=True)
+          api_workflow_template = upload_req.template_bundle.api_workflow_template
+          prepared_api_workflow = api_workflow_template.model_copy(deep=True)
 
           ######################################################################
-          await self._UploadValues(comfy_info=provisioned.comfy_info,
-                                   workflow=req.workflow,
-                                   prepared_workflow=prepared_workflow,
-                                   error_context=error_context.Copy())
+          await self._UploadValues(
+              comfy_info=provisioned.comfy_info,
+              workflow_template=upload_req.template_bundle.workflow_template,
+              prepared_api_workflow=prepared_api_workflow,
+              input_mappings=upload_req.template_bundle.input_mappings,
+              user_input_values=req.user_input_values,
+              error_context=error_context.Copy())
           error_context['prepared_workflow'] = await error_context.LargeToFile(
               'prepared_workflow',
-              prepared_workflow.model_dump(mode='json', round_trip=True))
+              prepared_api_workflow.model_dump(mode='json', round_trip=True))
           logger.info('Uploaded all user input values',
                       extra=error_context.Dump())
           ######################################################################
 
           history_dict = await catapult.Catapult(
               job_id=req.job_id,
-              prepared_workflow=prepared_workflow.model_dump(mode='json',
-                                                             round_trip=True),
-              important=req.workflow.template_bundle.important,
+              prepared_workflow=prepared_api_workflow.model_dump(
+                  mode='json', round_trip=True),
+              important=upload_req.template_bundle.important,
               job_debug_path=job_debug_path)
           error_context['history_dict'] = await error_context.LargeToFile(
               'history_dict', history_dict)
@@ -1226,9 +1242,11 @@ class Manager(ManagerBase):
           mapped_outputs: Dict[str, JSONSerializable]
           mapped_outputs = await self._DownloadValues(
               comfy_info=provisioned.comfy_info,
-              workflow=req.workflow,
-              prepared_workflow=prepared_workflow,
+              workflow_template=upload_req.template_bundle.workflow_template,
+              output_mappings=upload_req.template_bundle.output_mappings,
+              prepared_api_workflow=prepared_api_workflow,
               history=history,
+              user_input_values=req.user_input_values,
               error_context=error_context.Copy())
           error_context['mapped_outputs'] = await error_context.LargeToFile(
               'mapped_outputs', mapped_outputs)
@@ -1244,8 +1262,8 @@ class Manager(ManagerBase):
   async def Execute(self, req: ExecuteReq) -> ExecuteRes:
     return await self._Execute(req)
 
-  async def Touch(self, req: ManagerBase.TouchReq) -> ManagerBase.TouchRes:
+  async def Touch(self, req: TouchReq) -> TouchRes:
     res: ProvisionerBase.TouchRes
     res = await self._provisioner.Touch(
         ProvisionerBase.TouchReq(id=req.job_id, keepalive=req.keepalive))
-    return ManagerBase.TouchRes(success=res.success, message=res.message)
+    return Server.TouchRes(success=res.success, message=res.message)
