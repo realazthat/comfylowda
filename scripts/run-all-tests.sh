@@ -17,10 +17,11 @@ if [[ -z "${COMFY_API_URL}" ]]; then
 fi
 
 VENV_PATH="${PWD}/.venv" source "${PROJ_PATH}/scripts/utilities/ensure-venv.sh"
-REQS="${PWD}/requirements.txt" source "${PROJ_PATH}/scripts/utilities/ensure-reqs.sh"
+TOML=${PROJ_PATH}/pyproject.toml EXTRA=prod \
+  DEV_VENV_PATH="${PWD}/.cache/scripts/.venv" \
+  TARGET_VENV_PATH="${PWD}/.venv" \
+  bash "${PROJ_PATH}/scripts/utilities/ensure-reqs.sh"
 
-export PYTHONPATH=${PYTHONPATH:-}
-export PYTHONPATH=${PYTHONPATH}:${PWD}
 
 # Find all files in comfylowda that end in _test.py
 find comfylowda -name "*_test.py" | while read -r TEST_FILE; do

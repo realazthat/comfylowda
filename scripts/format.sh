@@ -5,16 +5,21 @@ set -e -x -v -u -o pipefail
 SCRIPT_DIR=$(realpath "$(dirname "${BASH_SOURCE[0]}")")
 source "${SCRIPT_DIR}/utilities/common.sh"
 
-VENV_PATH=.cache/scripts/.venv source "${PROJ_PATH}/scripts/utilities/ensure-venv.sh"
+VENV_PATH=${PWD}/.cache/scripts/.venv source "${PROJ_PATH}/scripts/utilities/ensure-venv.sh"
+TOML=${PROJ_PATH}/pyproject.toml EXTRA=dev \
+  DEV_VENV_PATH="${PWD}/.cache/scripts/.venv" \
+  TARGET_VENV_PATH="${PWD}/.cache/scripts/.venv" \
+  bash "${PROJ_PATH}/scripts/utilities/ensure-reqs.sh"
 
-REQS="${PROJ_PATH}/scripts/requirements-dev.txt" source "${PROJ_PATH}/scripts/utilities/ensure-reqs.sh"
+bash scripts/utilities/prettier.sh --parser markdown "${PWD}/README.md.jinja2" --write
 
-# Must have mdformat-gfm installed, otherwise checkboxes get messed up
-mdformat README.md.jinja2
-
-yapf -r ./comfylowda -i
-yapf ./setup.py -i
-autoflake --remove-all-unused-imports --in-place --recursive ./comfylowda
-isort ./comfylowda
+python -m yapf -r ./comfylowda -i --exclude '*.deleteme*'
+python -m autoflake --remove-all-unused-imports --in-place --recursive ./comfylowda
+if toml-sort "${PROJ_PATH}/pyproject.toml" --check; then
+  :
+else
+  toml-sort --in-place "${PROJ_PATH}/pyproject.toml"
+fi
+python -m isort ./comfylowda
 
 # vulture ./comfylowda

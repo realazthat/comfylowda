@@ -15,15 +15,17 @@ import uuid
 import fsspec
 import yaml
 from anyio import Path
+from comfy_catapult.comfy_schema import APIObjectInfo, APIWorkflow
 from rich.console import Console
 from slugify import slugify
 
+from .comfy_schema import Workflow
 from .comfyfs import RegisterComfyUIFS
-from .lowda import (APIObjectInfo, APIWorkflow, ComfyRemoteInfo,
-                    DumbProvisioner, FileDownloadMapSpec, FSSpecRemoteFileAPI,
-                    InputMapping, InputPPKind, IOSpec, OutputMapping,
-                    OutputPPKind, ProvisioningBundle, Server, Workflow,
-                    WorkflowTemplateBundle, YamlDump)
+from .error_utils import _YamlDump
+from .lowda import DumbProvisioner, FSSpecRemoteFileAPI, Server
+from .lowda_types import (ComfyRemoteInfo, FileDownloadMapSpec, InputMapping,
+                          InputPPKind, IOSpec, OutputMapping, OutputPPKind,
+                          ProvisioningSpec, WorkflowTemplateBundle)
 
 
 class JSONFormatter(logging.Formatter):
@@ -43,7 +45,7 @@ class YAMLFormatter(logging.Formatter):
     if self.usesTime():
       record.asctime = self.formatTime(record, self.datefmt)
     # Include any extra attributes in the log record, such as extra parameters
-    return '---\n' + YamlDump(record.__dict__)
+    return '---\n' + _YamlDump(record.__dict__)
 
 
 async def amain():
@@ -108,13 +110,13 @@ async def amain():
                  fs=fsspec.filesystem('file'),
                  mode='w')
 
-    manager = Server(provisioner=provisioner,
-                     remote=remote,
-                     tmp_dir_path=tmp_dir_path,
-                     debug_path=debug_path,
-                     debug_save_all=True)
+    manager = await Server.Create(provisioner=provisioner,
+                                  remote=remote,
+                                  tmp_dir_path=tmp_dir_path,
+                                  debug_path=debug_path,
+                                  debug_save_all=True)
 
-    provisioning = ProvisioningBundle(
+    provisioning = ProvisioningSpec(
         archives={},
         files={},
         custom_nodes={},
@@ -179,15 +181,15 @@ async def amain():
       res = await manager.UploadWorkflow(
           Server.UploadWorkflowReq(workflow_id=workflow_id,
                                    template_bundle=template_bundle,
-                                   provisioning=provisioning,
-                                   keepalive=60.))
+                                   prov_spec=provisioning))
       console.print(res)
       ##########################################################################
       exec_res: Server.ExecuteRes
       exec_res = await manager.Execute(
           Server.ExecuteReq(job_id=job_id,
                             workflow_id=workflow_id,
-                            user_input_values=user_input_values))
+                            user_input_values=user_input_values,
+                            keepalive=60.))
       console.print(exec_res)
       ##########################################################################
   except Exception as e:
@@ -195,4 +197,5 @@ async def amain():
     raise e
 
 
-asyncio.run(amain())
+if __name__ == '__main__':
+  asyncio.run(amain())

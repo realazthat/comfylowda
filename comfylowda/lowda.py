@@ -11,10 +11,11 @@ import enum
 import json
 import logging
 import textwrap
+import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime
 from pathlib import PurePath
-from typing import Annotated, Any, Dict, List, Literal, Tuple
+from typing import Any, Dict, List, Literal, Tuple
 from urllib.parse import urlparse
 
 import aiofiles
@@ -22,92 +23,31 @@ import fsspec
 import jsonschema
 import pydantic
 import pydash
-import yaml
 from anyio import Path
 from comfy_catapult.api_client import ComfyAPIClient
 from comfy_catapult.catapult import ComfyCatapult
 from comfy_catapult.comfy_schema import (APIHistoryEntry, APINodeID,
-                                         APIObjectInfo, APIOutputUI,
-                                         APIWorkflow, APIWorkflowNodeInfo,
-                                         ComfyFolderType, ComfyUIPathTriplet)
+                                         APIOutputUI, APIWorkflow,
+                                         APIWorkflowNodeInfo, ComfyFolderType,
+                                         ComfyUIPathTriplet)
 from comfy_catapult.comfy_utils import WatchVar
 from datauri import DataURI
-from pydantic import (BaseModel, ConfigDict, Field, RootModel, field_validator,
-                      model_validator)
+from pydantic import BaseModel
 from slugify import slugify
+
+from comfylowda import lowda_types
+from comfylowda.validation import _CheckModelRoundTrip
 
 from .comfy_schema import Workflow, WorkflowNode
 from .comfyfs import _Writable
+from .error_utils import _ErrorContext, _YamlDump
+from .lowda_types import (JSON_SERIALIZABLE_TYPES, ComfyRemoteInfo,
+                          FileUploadMapSpec, InputMapping, InputPPKind, IOSpec,
+                          IsJSONSerializable, JSONSerializable, OutputMapping,
+                          OutputPPKind, ProvisioningSpec, UploadWorkflowError,
+                          UserIOSpec)
 
 logger = logging.getLogger(__name__)
-
-JSON_SERIALIZABLE_TYPES = (str, int, float, bool, type(None), dict, list, tuple)
-
-
-def _IsJSONSerializable(value: Any) -> bool:
-  if isinstance(value, dict):
-    for k, v in value.items():
-      if not _IsJSONSerializable(k) or not _IsJSONSerializable(v):
-        return False
-    return True
-  if isinstance(value, (list, tuple)):
-    for v in value:
-      if not _IsJSONSerializable(v):
-        return False
-    return True
-  return isinstance(value, JSON_SERIALIZABLE_TYPES)
-
-
-JSONSerializable = Annotated[Any, 'JSONSerializable', _IsJSONSerializable]
-
-
-class _CustomDumper(yaml.Dumper):
-
-  def represent_tuple(self, data):
-    return self.represent_list(data)
-
-
-_CustomDumper.add_representer(tuple, _CustomDumper.represent_tuple)
-
-
-def YamlDump(data: Any) -> str:
-  return yaml.dump(data, indent=2, Dumper=_CustomDumper, sort_keys=False)
-
-
-class _ErrorContext:
-
-  def __init__(self, *, debug_path: Path, key: str):
-    self._debug_path = debug_path
-    self._key = key
-    self._error_context_path = self._debug_path / slugify(self._key)
-    self._context: Dict[str, JSONSerializable] = {}
-
-  async def LargeToFile(self, name: str, msg: JSONSerializable) -> str:
-    directory = self._error_context_path / slugify(datetime.now().isoformat())
-    await directory.mkdir(parents=True, exist_ok=True)
-    path = directory / slugify(name)
-    yaml_path = path.with_suffix('.yaml')
-    await yaml_path.write_text(YamlDump(msg))
-    return yaml_path.as_uri()
-
-  def Add(self, *, name: str, msg: JSONSerializable) -> None:
-    self._context[name] = msg
-
-  def Dump(self) -> JSONSerializable:
-    return self._context
-
-  def Copy(self) -> '_ErrorContext':
-    copy_cxt = _ErrorContext(debug_path=self._debug_path, key=self._key)
-    copy_cxt._context = self._context.copy()
-    return copy_cxt
-
-  def __setitem__(self, key: str, value: JSONSerializable) -> None:
-    self._context[key] = value
-
-
-def _URL(url: str) -> str:
-  # TODO: This should check if the URL is valid; used for documentation.
-  return url
 
 
 def _DiscardPrefix(path: str, prefix: str | None) -> str:
@@ -182,36 +122,6 @@ def _FindNode(
       return _FindNodeByID(workflow=workflow, node_id=str(node_id_or_name))
 
 
-class IOSpec(BaseModel):
-  io_url: str
-  """This could be a file URI, or any supported protocol.
-  
-  Additionally, it can be a comfy+http or comfy+https URL in the form of:
-  comfy+https://comfy-server-host:port/folder_type/subfolder/sub/sub/filename
-  
-  This URL can be used to upload and download files to and from the comfy
-  server.
-
-  If the comfy+http or comfy+https URL is used, then the ComfyUI API will
-  directly be used for upload and download for all upload/download operations.
-  """
-
-  @field_validator('io_url')
-  @classmethod
-  def check_io_url(cls, v):
-    try:
-      urlparse(v)
-    except ValueError as e:
-      raise ValueError(f'Invalid URL: {v}') from e
-    return v
-
-  kwargs: Dict[str, Any] = {}
-  """kwargs to be passed to the fsspec.open() function.
-  
-  Useful for specifying account credentials.
-  """
-
-
 class RemoteFileAPIBase(ABC):
 
   @abstractmethod
@@ -238,10 +148,14 @@ def _RenameURLPath(url: str, counter: int) -> str:
   return url_pr.geturl()
 
 
+class NoMatchingFS(Exception):
+  pass
+
+
 class FSSpecRemoteFileAPI(RemoteFileAPIBase):
   Mode = Literal['r', 'w', 'rw']
 
-  class Overwrite(enum.StrEnum):
+  class Overwrite(str, enum.Enum):
     FAIL = enum.auto()
     OVERWRITE = enum.auto()
     RENAME = enum.auto()
@@ -358,12 +272,17 @@ class FSSpecRemoteFileAPI(RemoteFileAPIBase):
         return dst.renamed
     return final_dst_url
 
-  def _GetFS(self, uri: str, mode: Mode) -> fsspec.spec.AbstractFileSystem:
+  def _GetRegisteredPrefixes(self, mode: Mode) -> List[str]:
+    return list(self._fs[mode].keys())
+
+  def _GetFS(self, url: str, mode: Mode) -> fsspec.spec.AbstractFileSystem:
     for url_prefix, fs in self._fs[mode].items():
-      if uri.startswith(url_prefix):
+      if url.startswith(url_prefix):
         return fs
-    raise ValueError(
-        f'No matching FS for {json.dumps(uri)}, self._fs: {list(self._fs)}')
+
+    prefixes = self._GetRegisteredPrefixes(mode)
+    raise NoMatchingFS(f'No matching FS for {url}, in mode {mode}, registered '
+                       f'prefixes for this mode: {prefixes}')
 
 
 async def _DownloadURLToB64(*, remote: RemoteFileAPIBase, io_spec: IOSpec,
@@ -381,10 +300,10 @@ async def _DownloadURLToB64(*, remote: RemoteFileAPIBase, io_spec: IOSpec,
       return base64.b64encode(bytes_).decode('utf-8')
 
 
-async def _UploadDataURI(*, remote: RemoteFileAPIBase, src_uri: str,
+async def _UploadDataURI(*, remote: RemoteFileAPIBase, src_data_uri: str,
                          untrusted_dst_io_spec: IOSpec,
                          tmp_dir_path: Path) -> str:
-  data_uri = DataURI(src_uri)
+  data_uri = DataURI(src_data_uri)
   filename = PurePath(urlparse(untrusted_dst_io_spec.io_url).path).name
   async with aiofiles.tempfile.TemporaryDirectory(
       dir=tmp_dir_path) as tmp_child_dir_path:
@@ -395,14 +314,6 @@ async def _UploadDataURI(*, remote: RemoteFileAPIBase, src_uri: str,
     await tmp_path.write_bytes(data_uri.data)
     return await remote.UploadFile(trusted_src_path=tmp_path,
                                    untrusted_dst_io_spec=untrusted_dst_io_spec)
-
-
-class ComfyRemoteInfo(BaseModel):
-  comfy_api_url: str
-  # {prefix => URL}
-  upload: Dict[str, IOSpec]
-  download: Dict[str, IOSpec]
-  logs: IOSpec | None
 
 
 def _GetRemoteIOSpec(*, path: PurePath, prefix2iospec: Dict[str,
@@ -418,38 +329,6 @@ def _GetRemoteIOSpec(*, path: PurePath, prefix2iospec: Dict[str,
       f'No matching prefix for {json.dumps(path)}, prefix2url: {prefix2iospec}')
 
 
-class ProvisioningBundle(BaseModel):
-  files: Dict[str, IOSpec]
-  archives: Dict[str, IOSpec]
-  custom_nodes: Dict[str, IOSpec]
-
-
-class InputPPKind(enum.Enum):
-  VALUE = enum.auto()
-  """Anything JSON Serializable. Just gets passed through."""
-  FILE = enum.auto()
-  """A file. Gets uploaded according to the upload spec."""
-
-
-class UserIOSpec(RootModel[IOSpec | str]):
-  root: IOSpec | str
-
-  @field_validator('root')
-  @classmethod
-  def check_root(cls, v):
-    if isinstance(v, str):
-      try:
-        urlparse(v)
-      except ValueError as e:
-        raise ValueError(f'Invalid URL: {v}') from e
-    return v
-
-  def ToIOSpec(self) -> IOSpec:
-    if not isinstance(self.root, str):
-      return self.root
-    return IOSpec(io_url=self.root)
-
-
 def _ParseUserIOSpec(user_input_value: JSONSerializable) -> UserIOSpec:
   io_spec_validator = pydantic.TypeAdapter[UserIOSpec](UserIOSpec)
   if not isinstance(user_input_value, str):
@@ -460,239 +339,11 @@ def _ParseUserIOSpec(user_input_value: JSONSerializable) -> UserIOSpec:
     return UserIOSpec(root=user_input_value)
 
 
-class FileUploadMapSpec(BaseModel):
-  upload_to: str | ComfyUIPathTriplet = Field(
-      ...,
-      description="""Location to upload the file to.
-
-Either a path relative to ComfyUI installation, or a triplet.
-
-The path must not be absolute.
-
-Note that some nodes only allow certain subfolders, e.g 'temp' or 'output/custom_node_name'.""",
-      alias='to')
-
-  @field_validator('upload_to')
-  @classmethod
-  def check_upload_to(cls, v):
-    if isinstance(v, str):
-      if PurePath(v).is_absolute():
-        raise ValueError(f'upload_to must not be absolute: {v}')
-    return v
-
-  node_mode: Literal['TRIPLET', 'FILEPATH'] = Field(
-      ...,
-      description="""How the node expects the filepath to be passed in as input.
-
-Some nodes expect a triplet, some expect a relative filepath string.
-
-For those that expect a relative filepath string, some expect it relative to
-the ComfyUI installation path, and some expect it relative to the 'input'
-folder; others use other relative paths, such as 'input/custom_node_inputs/'
-or even in some non-standard relative path (this is only supported if the
-provisioned ComfyUI instance is specified with a way to upload files other
-than the ComfyUI API, because the ComfyUI API only supports upload to
-`/path/to/comfyui/input`).
-
-See discard_prefix.
-""",
-      alias='mode')
-  discard_prefix: str | None = Field(
-      ...,
-      description=
-      """The prefix to be discarded from the filepath when passing the filepath to the node.
-
-This should only be used with FILEPATH mode, and only if node expects filepath
-strings to be relative to something other than the ComfyUI root path.
-
-Some nodes assume that a filepath is relative to a certain path.
-
-For example, the 'Load Image' node assumes that the filepath is relative to
-the 'input' folder. So the prefix for that should be 'input/'.
-
-This prefix should not start with a slash.
-
-Note on trailing slash: different nodes may or may not require a trailing
-slash here; depending on if the node expects a slash in the beginning of the
-file path.
-""",
-      alias='pfx')
-
-  @field_validator('discard_prefix')
-  @classmethod
-  def check_discard_prefix(cls, v):
-    if v is not None:
-      if not isinstance(v, str):
-        raise ValueError(f'discard_prefix must be str or None: {v}')
-      if PurePath(v).is_absolute():
-        raise ValueError(f'discard_prefix must not be absolute: {v}')
-    return v
-
-  @model_validator(mode='after')
-  def check_prefix_implies_filename(self):
-    prefix_implies_filename = (self.discard_prefix is None
-                               or self.node_mode == 'FILEPATH')
-    if not prefix_implies_filename:
-      raise ValueError(
-          'discard_prefix is only valid when node_mode is FILEPATH')
-    return self
-
-
-class FileDownloadMapSpec(BaseModel):
-  """If this is set, then a node output will be interpreted as a file and downloaded according to a user specified spec.
-
-  This class specifies how to extract the file from the node output and download it.
-
-  The user must specify an input value to specify the download URL to their system.
-
-  They can either use a globally accessible IOSpec, or a string 'base64'.
-
-  TODO: Show example.
-  """
-  node_mode: Literal['TRIPLET', 'FILEPATH'] = Field(
-      ...,
-      description=
-      f"""How the node output (see {_URL("https://github.com/realazthat/comfylowda/blob/master/comfylowda/assets/example_history.yaml")}) outputs the filepath.
-
-Some nodes output a triplet, some output a filepath, some output a filepath that is relative to a certain path inside the ComfyUI installation.
-""",
-      alias='mode')
-  prepend_prefix: str | None = Field(
-      ...,
-      description=
-      """The prefix to be prepended to the filepath reading the value from the node.
-
-Some nodes assume that a filepath is relative to a certain path.
-
-This tells the downloader to prepend the prefix in order to find the file.
-  """,
-      alias='pfx')
-
-  @field_validator('prepend_prefix')
-  @classmethod
-  def check_prepend_prefix(cls, v):
-    if v is not None:
-      if not isinstance(v, str):
-        raise ValueError(f'prepend_prefix must be str or None: {v}')
-      if PurePath(v).is_absolute():
-        raise ValueError(f'prepend_prefix must not be absolute: {v}')
-    return v
-
-  @model_validator(mode='after')
-  def check_exclusivity(self):
-    prefix_implies_filename = (self.prepend_prefix is None
-                               or self.node_mode == 'FILEPATH')
-    if not prefix_implies_filename:
-      raise ValueError(
-          'prepend_prefix is only valid when node_mode is FILEPATH')
-    return self
-
-
-class OutputPPKind(enum.StrEnum):
-  NODE_VALUE = enum.auto()
-  """Anything JSON Serializable. Just gets passed through as an output value."""
-  FILE = enum.auto()
-  """JSON Serializable dict that will be validated using DownloadFile."""
-
-
-class InputMapping(BaseModel):
-  name: str = Field(
-      ...,
-      description=
-      'The name of the input. This is the key that the user will be expected to use in their input JSON.'
-  )
-  node: APINodeID | str | int = Field(
-      ...,
-      description=
-      'The id or unique title of a node in the ComfyUI {API, regular} Workflow.'
-  )
-  field: str | None = Field(
-      ...,
-      description=
-      f"""A pydash field path, for the pydash.get() and pydash.set_() functions.
-
-The field_path begins at the .inputs field of a node in the ComfyUI Workflow API format.'
-See {_URL('https://github.com/realazthat/comfylowda/blob/master/comfylowda/assets/sdxlturbo_example_api.json')}
-for an example Workflow API format. If specified, this will copy the'
-input value to the field path.
-""")
-  pp: InputPPKind = Field(
-      ..., description='You can choose a preprocessor, e.g upload a file.')
-  pp_spec: FileUploadMapSpec | None = Field(
-      None, description='If pp==FILE, then this is required.', alias='spec')
-
-  @model_validator(mode='after')
-  def check_exclusivity(self):
-    if (self.pp == InputPPKind.FILE) != (self.pp_spec is not None):
-      raise ValueError(
-          'If pp!=VALUE, then pp_spec is required. Otherwise, it must be None.')
-    return self
-
-  user_json_spec: Literal['NO_PUBLIC_INPUT'] | Literal['ANY'] | Literal[
-      'OPT_ANY'] | dict = Field(
-          ..., description='JSON spec to verify the user input.')
-  user_value: JSONSerializable = Field(
-      ..., description='The default input value to use.')
-
-
-class OutputMapping(BaseModel):
-  """Defines a mapping from the /history/{prompt_id} entry to a field in the user output.
-  """
-  model_config = ConfigDict(use_enum_values=True)
-  name: str = Field(
-      ...,
-      description="""
-The name of the output. This is the key that will be used in the output JSON.
-
-If this mapping requires user input, this is the key that the user will be
-expected to use in their output JSON.
-""")
-  node: APINodeID | str | int = Field(
-      ...,
-      description=
-      'The id or unique title of a node in the ComfyUI {API, regular} Workflow')
-  field: str = Field(
-      ...,
-      description=
-      'A pydash field path, for the pydash.get() and pydash.set_() functions.'
-      ' The field_path begins at the job_prompt_id.outputs.node_id in the ComfyUI Workflow API format.'
-      ' See https://github.com/realazthat/comfylowda/blob/master/comfylowda/assets/example_history.yaml'
-      ' for an example ComfyUI /history format.')
-  pp: OutputPPKind = Field(
-      ...,
-      description=
-      'You can choose a field type to have lowda do some post processing, e.g download a file.'
-  )
-  pp_spec: FileDownloadMapSpec | None = Field(
-      ..., description='If pp!=VALUE, then this is required.', alias='spec')
-  user_json_spec: Literal['NO_PUBLIC_INPUT'] | Literal['ANY'] | Literal[
-      'OPT_ANY'] | dict = Field(
-          ..., description='JSON spec to verify the user input.')
-  user_value: JSONSerializable = Field(
-      ..., description='The default input value to use.')
-
-  @model_validator(mode='after')
-  def check_exclusivity(self):
-    if (self.pp == OutputPPKind.FILE) != (self.pp_spec is not None):
-      raise ValueError(
-          'If pp!=VALUE, then pp_spec is required. Otherwise, it must be None.')
-    return self
-
-
-class WorkflowTemplateBundle(BaseModel):
-  workflow_template: Workflow
-  api_workflow_template: APIWorkflow
-  important: List[APINodeID]
-  object_info: APIObjectInfo
-  input_mappings: List[InputMapping]
-  output_mappings: List[OutputMapping]
-
-
 class ProvisionerBase(ABC):
 
   class ProvisionReq(BaseModel):
     id: str
-    bundle: ProvisioningBundle
+    bundle: ProvisioningSpec
     keepalive: float
 
   class ProvisionRes(BaseModel):
@@ -732,41 +383,27 @@ class DumbProvisioner(ProvisionerBase):
 
 
 class ServerBase(ABC):
-
-  class UploadWorkflowReq(BaseModel):
-    workflow_id: str
-    template_bundle: WorkflowTemplateBundle
-    provisioning: ProvisioningBundle
-    keepalive: float
-
-  class UploadWorkflowRes(BaseModel):
-    pass
+  UploadWorkflowReq = lowda_types.UploadWorkflowReq
+  UploadWorkflowError = lowda_types.UploadWorkflowError
+  UploadWorkflowRes = lowda_types.UploadWorkflowRes
+  DownloadWorkflowReq = lowda_types.DownloadWorkflowReq
+  DownloadWorkflowSuccess = lowda_types.DownloadWorkflowSuccess
+  DownloadWorkflowError = lowda_types.DownloadWorkflowError
+  DownloadWorkflowRes = lowda_types.DownloadWorkflowRes
+  ExecuteReq = lowda_types.ExecuteReq
+  ExecuteSuccess = lowda_types.ExecuteSuccess
+  ExecuteError = lowda_types.ExecuteError
+  ExecuteRes = lowda_types.ExecuteRes
+  TouchReq = lowda_types.TouchReq
+  TouchRes = lowda_types.TouchRes
 
   @abstractmethod
   async def UploadWorkflow(self, req: UploadWorkflowReq) -> UploadWorkflowRes:
     raise NotImplementedError()
 
-  class ExecuteReq(BaseModel):
-    job_id: str
-    workflow_id: str
-    user_input_values: Dict[str, JSONSerializable]
-
-  class ExecuteRes(BaseModel):
-    job_id: str
-    history: APIHistoryEntry
-    mapped_outputs: Dict[str, JSONSerializable]
-
   @abstractmethod
   async def Execute(self, req: ExecuteReq) -> ExecuteRes:
     raise NotImplementedError()
-
-  class TouchReq(BaseModel):
-    job_id: str
-    keepalive: float
-
-  class TouchRes(BaseModel):
-    success: bool
-    message: str
 
   @abstractmethod
   async def Touch(self, req: TouchReq) -> TouchRes:
@@ -796,7 +433,7 @@ class PreProcessorBase(ABC):
       raise ValueError('Expected user_input_value to be one of '
                        f'{JSON_SERIALIZABLE_TYPES}, '
                        f'got {type(user_input_value)}')
-    if not _IsJSONSerializable(user_input_value):
+    if not IsJSONSerializable(user_input_value):
       raise ValueError('Expected IsJSONSerializable(user_input_value)==True')
 
   @abstractmethod
@@ -818,7 +455,7 @@ class ValuePreProcessor(PreProcessorBase):
                        f'{JSON_SERIALIZABLE_TYPES}, because '
                        f'InputMapping.pp={json.dumps(mapping.pp)}, '
                        f'got {type(user_input_value)}')
-    if not _IsJSONSerializable(user_input_value):
+    if not IsJSONSerializable(user_input_value):
       raise ValueError(
           'Expected user_input_value to be JSONSerializable, because '
           f'InputMapping.pp={json.dumps(mapping.pp)}, '
@@ -838,9 +475,9 @@ class FilePreProcessor(PreProcessorBase):
       user_input_value: JSONSerializable) -> JSONSerializable:
     self.Validate(user_input_value)
 
-    if mapping.pp_spec is None:
+    if mapping.spec is None:
       raise ValueError('mapping.spec is None for mapping.pp=FILE')
-    file_mapping_spec: FileUploadMapSpec = mapping.pp_spec
+    file_mapping_spec: FileUploadMapSpec = mapping.spec
 
     src_io_spec = _ParseUserIOSpec(user_input_value).ToIOSpec()
 
@@ -860,7 +497,7 @@ class FilePreProcessor(PreProcessorBase):
     remote_url: str
     if src_io_spec.io_url.startswith('data:'):
       remote_url = await _UploadDataURI(remote=self._remote,
-                                        src_uri=src_io_spec.io_url,
+                                        src_data_uri=src_io_spec.io_url,
                                         untrusted_dst_io_spec=dst_io_spec,
                                         tmp_dir_path=self._tmp_dir_path)
     else:
@@ -897,13 +534,13 @@ class PostProcessorBase(ABC):
       raise ValueError('Expected user_input_value to be one of '
                        f'{JSON_SERIALIZABLE_TYPES}, '
                        f'got {type(user_input_value)}')
-    if not _IsJSONSerializable(user_input_value):
+    if not IsJSONSerializable(user_input_value):
       raise ValueError('Expected IsJSONSerializable(user_output_value)==True')
     if not isinstance(node_output_value, JSON_SERIALIZABLE_TYPES):
       raise ValueError('Expected node_output_value to be one of '
                        f'{JSON_SERIALIZABLE_TYPES}, '
                        f'got {type(node_output_value)}')
-    if not _IsJSONSerializable(node_output_value):
+    if not IsJSONSerializable(node_output_value):
       raise ValueError('Expected IsJSONSerializable(node_output_value)==True')
 
 
@@ -961,7 +598,7 @@ def _GetInputValue(mapping: InputMapping | OutputMapping,
       raise ValueError(
           f'input_mapping.name={json.dumps(mapping.name)}'
           f' provided by the user not in user_input_values {json.dumps(list(user_input_values.keys()))}'
-          f'\n\n{textwrap.indent(YamlDump(error_context.Dump()), "  ")}')
+          f'\n\n{textwrap.indent(_YamlDump(error_context.Dump()), "  ")}')
     value = user_input_values[mapping.name]
     if mapping.user_json_spec == 'ANY':
       return value
@@ -971,18 +608,47 @@ def _GetInputValue(mapping: InputMapping | OutputMapping,
         format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 
 
+class _Error(Exception):
+
+  def __init__(self, *, user_message: str, internal_message: str,
+               status_code: int | None, error_name: str,
+               io_name: str | None) -> None:
+    super().__init__(internal_message)
+    self.user_message = user_message
+    self.internal_message = internal_message
+    self.status_code = status_code
+    self.error_name = error_name
+    self.io_name = io_name
+
+
 class Server(ServerBase):
   UploadWorkflowReq = ServerBase.UploadWorkflowReq
   UploadWorkflowRes = ServerBase.UploadWorkflowRes
+  DownloadWorkflowReq = ServerBase.DownloadWorkflowReq
+  DownloadWorkflowRes = ServerBase.DownloadWorkflowRes
   ExecuteReq = ServerBase.ExecuteReq
   ExecuteRes = ServerBase.ExecuteRes
 
   TouchReq = ServerBase.TouchReq
   TouchRes = ServerBase.TouchRes
 
+  @classmethod
+  async def Create(cls, *, provisioner: ProvisionerBase,
+                   remote: RemoteFileAPIBase, tmp_dir_path: Path,
+                   debug_path: Path, debug_save_all: bool) -> 'Server':
+    return cls(provisioner=provisioner,
+               remote=remote,
+               tmp_dir_path=tmp_dir_path,
+               debug_path=debug_path,
+               debug_save_all=debug_save_all,
+               _private_please_use_create=cls._PrivatePleaseUseCreate())
+
+  class _PrivatePleaseUseCreate:
+    pass
+
   def __init__(self, *, provisioner: ProvisionerBase, remote: RemoteFileAPIBase,
-               tmp_dir_path: Path, debug_path: Path,
-               debug_save_all: bool) -> None:
+               tmp_dir_path: Path, debug_path: Path, debug_save_all: bool,
+               _private_please_use_create: _PrivatePleaseUseCreate) -> None:
     self._provisioner = provisioner
     self._remote = remote
     self._tmp_dir_path = tmp_dir_path
@@ -1002,8 +668,36 @@ class Server(ServerBase):
 
   async def UploadWorkflow(
       self, req: ServerBase.UploadWorkflowReq) -> ServerBase.UploadWorkflowRes:
-    self._workflows[req.workflow_id] = req
-    return ServerBase.UploadWorkflowRes()
+    error_context = await _ErrorContext.Create(debug_path=self._debug_path,
+                                               key='UploadWorkflow')
+    error_context['req'] = await error_context.LargeToFile(
+        'req', req.model_dump(mode='json', round_trip=True))
+    error_context['workflow_id'] = req.workflow_id
+    logger.info('UploadWorkflow', extra={'error_context': error_context.Dump()})
+    try:
+      self._workflows[req.workflow_id] = req
+      return ServerBase.UploadWorkflowRes(error=None)
+    except Exception:
+      error_id = str(uuid.uuid4())
+      status_code = 500
+      error_name = 'UploadWorkflowError'
+      message = 'Internal Server Error'
+
+      error_context['error_id'] = error_id
+      error_context['status_code'] = status_code
+      error_context['error_name'] = error_name
+      error_context['message'] = message
+
+      logger.exception('UploadWorkflow failed',
+                       exc_info=True,
+                       stack_info=True,
+                       extra={'error_context': error_context.Dump()})
+      return ServerBase.UploadWorkflowRes(
+          error=UploadWorkflowError(error_id=error_id,
+                                    status_code=status_code,
+                                    name=error_name,
+                                    message=message,
+                                    context=error_context.UserDump()))
 
   async def _KeepAlive(self, job_id: str, keepalive: float) -> None:
     try:
@@ -1073,10 +767,20 @@ class Server(ServerBase):
                          exc_info=True,
                          stack_info=True,
                          extra=error_context.Dump())
-        raise ValueError(
-            f'Failed to upload {json.dumps(input_mapping.name)}'
-            f'\n\n{textwrap.indent(YamlDump(error_context.Dump()), "  ")}'
-        ) from e
+        error_name = 'UploadError'
+        status_code = 500
+        user_message = 'Internal Server Error'
+        internal_message = f'Failed to upload {json.dumps(input_mapping.name)}, e: {e}'
+        if isinstance(e, NoMatchingFS):
+          error_name = 'NoMatchingFS'
+          status_code = 400
+          user_message = f'Error with uploading {json.dumps(input_mapping.name)}: {e}'
+
+        raise _Error(user_message=user_message,
+                     internal_message=internal_message,
+                     status_code=status_code,
+                     error_name=error_name,
+                     io_name=input_mapping.name) from e
 
   async def _DownloadValue(self, comfy_info: ComfyRemoteInfo,
                            workflow_template: Workflow,
@@ -1102,13 +806,15 @@ class Server(ServerBase):
       raise ValueError(
           f'Expected node_output_value to be one of {JSON_SERIALIZABLE_TYPES}, got {type(node_output_value_any)}'
       )
-    if not _IsJSONSerializable(node_output_value_any):
+    if not IsJSONSerializable(node_output_value_any):
       raise ValueError(
           f'Expected node_output_value to be JSONSerializable, got {type(node_output_value_any)}'
       )
     node_output_value = node_output_value_any
     if pp not in self._post_processors:
-      raise ValueError(f'pp={pp} not in self._output_processors')
+      raise ValueError(
+          f'pp={repr(pp)} (type(pp)={type(pp)}) not in self._post_processors,'
+          f' self._post_processors: {list(self._post_processors.keys())}')
     processor = self._post_processors[pp]
     user_input_value: JSONSerializable
     user_input_value = _GetInputValue(output_mapping,
@@ -1152,27 +858,86 @@ class Server(ServerBase):
                          exc_info=True,
                          stack_info=True,
                          extra=error_context.Dump())
-        raise ValueError(
-            f'Failed to download {json.dumps(output_mapping.name)}'
-            f'\n\n{textwrap.indent(YamlDump(error_context.Dump()), "  ")})'
+        error_name = 'DownloadError'
+        status_code = 500
+        internal_message = f'Failed to download {json.dumps(output_mapping.name)}, e: {e}'
+        user_message = 'Internal Server Error'
+        if isinstance(e, NoMatchingFS):
+          error_name = 'NoMatchingFS'
+          status_code = 400
+          user_message = f'Error with downloading {json.dumps(output_mapping.name)}: {e}'
+        raise _Error(
+            user_message=user_message,
+            internal_message=internal_message,
+            status_code=status_code,
+            error_name=error_name,
+            io_name=output_mapping.name,
         ) from e
 
     return user_output_values
 
-  async def _Execute(self, req: ExecuteReq) -> ExecuteRes:
-    if req.workflow_id not in self._workflows:
-      raise ValueError(f'Workflow not found: {req.workflow_id}')
+  async def _DownloadWorkflow(
+      self, req: DownloadWorkflowReq,
+      error_context: _ErrorContext) -> ServerBase.DownloadWorkflowSuccess:
     upload_req: ServerBase.UploadWorkflowReq = self._workflows[req.workflow_id]
-    provisioning: ProvisioningBundle = upload_req.provisioning
-
-    error_context = _ErrorContext(debug_path=self._debug_path, key=req.job_id)
-    error_context['req'] = await error_context.LargeToFile(
-        'req', req.model_dump(mode='json', round_trip=True))
     error_context['upload_req'] = await error_context.LargeToFile(
         'upload_req', upload_req.model_dump(mode='json', round_trip=True))
-    error_context['provisioning'] = provisioning.model_dump(mode='json',
-                                                            round_trip=True)
-    error_context['keepalive'] = upload_req.keepalive
+    return ServerBase.DownloadWorkflowSuccess(
+        workflow_id=upload_req.workflow_id,
+        template_bundle=upload_req.template_bundle,
+        prov_spec=upload_req.prov_spec)
+
+  async def DownloadWorkflow(self,
+                             req: DownloadWorkflowReq) -> DownloadWorkflowRes:
+    error_context = await _ErrorContext.Create(debug_path=self._debug_path,
+                                               key='DownloadWorkflow')
+    error_context['req'] = await error_context.LargeToFile(
+        'req', req.model_dump(mode='json', round_trip=True))
+    error_context['req.workflow_id'] = req.workflow_id
+    try:
+      success = await self._DownloadWorkflow(req,
+                                             error_context=error_context.Copy())
+      return ServerBase.DownloadWorkflowRes(success=success, error=None)
+    except Exception as e:
+      error_id = uuid.uuid4().hex
+      status_code = 500
+      error_name = 'InternalError'
+      message = f'An internal error occurred. Please report this error with the error_id: {json.dumps(error_id)}'
+      if isinstance(e, KeyError):
+        error_name = 'WorkflowNotFound'
+        status_code = 404
+        message = f'Workflow not found: {req.workflow_id}'
+      logger.exception('DownloadWorkflow failed',
+                       exc_info=True,
+                       stack_info=True,
+                       extra=error_context.Dump())
+      error = ServerBase.DownloadWorkflowError(error_id=error_id,
+                                               status_code=status_code,
+                                               name=error_name,
+                                               message=message,
+                                               context=error_context.UserDump())
+      return ServerBase.DownloadWorkflowRes(success=None, error=error)
+
+  async def _Execute(self, req: ExecuteReq,
+                     error_context: _ErrorContext) -> ServerBase.ExecuteSuccess:
+    error_context['req'] = await error_context.LargeToFile(
+        'req', req.model_dump(mode='json', round_trip=True))
+    error_context['req.workflow_id'] = req.workflow_id
+
+    _CheckModelRoundTrip(model=req, t=ServerBase.ExecuteReq)
+
+    if req.workflow_id not in self._workflows:
+      raise ValueError(f'Workflow not found: {req.workflow_id}')
+
+    upload_req: ServerBase.UploadWorkflowReq = self._workflows[req.workflow_id]
+    error_context['upload_req'] = await error_context.LargeToFile(
+        'upload_req', upload_req.model_dump(mode='json', round_trip=True))
+
+    prov_spec: ProvisioningSpec = upload_req.prov_spec
+    error_context['prov_spec'] = prov_spec.model_dump(mode='json',
+                                                      round_trip=True)
+
+    error_context['keepalive'] = req.keepalive
     error_context['user_input_values'] = await error_context.LargeToFile(
         'user_input_values', req.user_input_values)
 
@@ -1188,16 +953,14 @@ class Server(ServerBase):
     ProvisionReq = ProvisionerBase.ProvisionReq
     provisioned: ProvisionerBase.ProvisionRes
     provisioned = await self._provisioner.Provision(
-        ProvisionReq(id=req.job_id,
-                     bundle=provisioning,
-                     keepalive=upload_req.keepalive))
+        ProvisionReq(id=req.job_id, bundle=prov_spec, keepalive=req.keepalive))
     error_context['provisioned'] = provisioned.model_dump(mode='json',
                                                           round_trip=True)
     logger.info('Successfully provisioned a ComfyUI instance',
                 extra=error_context.Dump())
     ############################################################################
     keepalive_task = asyncio.create_task(
-        self._KeepAlive(req.job_id, upload_req.keepalive))
+        self._KeepAlive(req.job_id, req.keepalive))
     ############################################################################
 
     try:
@@ -1253,14 +1016,47 @@ class Server(ServerBase):
           logger.info('Downloaded all user output values',
                       extra=error_context.Dump())
           ######################################################################
-          return self.ExecuteRes(job_id=req.job_id,
-                                 history=history,
-                                 mapped_outputs=mapped_outputs)
+          return ServerBase.ExecuteSuccess(job_id=req.job_id,
+                                           history=history,
+                                           mapped_outputs=mapped_outputs)
     finally:
       keepalive_task.cancel()
 
   async def Execute(self, req: ExecuteReq) -> ExecuteRes:
-    return await self._Execute(req)
+    try:
+      error_context = await _ErrorContext.Create(debug_path=self._debug_path,
+                                                 key=req.job_id)
+      error_context['req'] = await error_context.LargeToFile(
+          'req', req.model_dump(mode='json', round_trip=True))
+      # TODO: Make a blocking option that sends keepalives.
+      # TODO: Make a nonblocking option that can be queried for status.
+
+      success = await self._Execute(req, error_context=error_context.Copy())
+      return Server.ExecuteRes(success=success, error=None)
+    except Exception as e:
+      error_id = uuid.uuid4().hex
+      status_code = 500
+      error_name = 'InternalError'
+      message = f'An internal error occurred. Please report this error with the error_id: {json.dumps(error_id)}'
+      if isinstance(e, _Error):
+        status_code = 400
+        error_name = e.error_name
+        message = e.user_message
+      error_context['error_id'] = error_id
+      error_context['error_name'] = error_name
+      error_context['status_code'] = status_code
+      logger.exception('Execute failed',
+                       exc_info=True,
+                       stack_info=True,
+                       extra={'error_context': error_context.Dump()})
+      return Server.ExecuteRes(success=None,
+                               error=Server.ExecuteError(
+                                   error_id=error_id,
+                                   status_code=status_code,
+                                   name=error_name,
+                                   message=message,
+                                   context=error_context.UserDump(),
+                               ))
 
   async def Touch(self, req: TouchReq) -> TouchRes:
     res: ProvisionerBase.TouchRes

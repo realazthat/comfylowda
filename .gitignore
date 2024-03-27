@@ -4,11 +4,12 @@ __pycache__
 .deleteme
 .cache
 NOTES.md
-.logs/
+.logs
 build/
 comfy_lowda.egg-info/
+comfylowda.egg-info/
 .deleteme
 **/.deleteme*
 .scrap/
 dist/
-.data/
+.data
