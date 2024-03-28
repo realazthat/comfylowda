@@ -130,7 +130,6 @@ async def amain():
         yaml.safe_load(await object_info_path.read_text()))
     ############################################################################
     job_id = slugify(uuid.uuid4().hex)
-    print('job_id:', job_id)
 
     template_bundle = WorkflowTemplateBundle(
         workflow_template=workflow_template,

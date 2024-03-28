@@ -220,9 +220,6 @@ def Parse(*, version: str) -> Arguments:
                   error_context=error_context.copy())
   args = parser.parse_args()
 
-  print(args)
-  # return args
   args_typed: Arguments = helper.Parse(args, Arguments, context)
-  print(args_typed)
 
   return args_typed

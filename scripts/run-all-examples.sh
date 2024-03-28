@@ -35,8 +35,6 @@ OUTPUT_DIR="${PWD}/.deleteme/.data/output"
 mkdir -p "${OUTPUT_DIR}"
 mkdir -p "${INPUT_DIR}"
 
-# -i "{\"name\":\"Preview Image\",\"value\":\"file://${OUTPUT_DIR}/output.png\"}"
-
 python -m comfylowda.cli execute \
   --tmp-dir-path .deleteme/tmp/ \
   --debug-path .deleteme/debug/ \
