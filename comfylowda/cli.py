@@ -25,8 +25,6 @@ from pydantic import BaseModel, ValidationError
 from rich.console import Console
 from typing_extensions import TypeVar
 
-from comfylowda.lowda_types import JSONSerializable
-
 from . import _build_version
 from .args import (Arguments, ClientCommand, ClientExecuteCommand,
                    ClientUploadCommand, ExecuteArgs, ExecuteCommand, FSArg,
@@ -37,8 +35,9 @@ from .error_utils import _ErrorContext, _YamlDump
 from .log import _SetupLogging
 from .lowda import (DumbProvisioner, FSSpecRemoteFileAPI, ProvisionerBase,
                     Server, ServerBase)
-from .lowda_types import (ComfyRemoteInfo, InputMapping, IOSpec, OutputMapping,
-                          ProvisioningSpec, WorkflowTemplateBundle)
+from .lowda_types import (ComfyRemoteInfo, InputMapping, IOSpec,
+                          JSONSerializable, OutputMapping, ProvisioningSpec,
+                          WorkflowTemplateBundle)
 from .validation import _CheckModelRoundTrip, _DoubleValidateJSON
 from .web.app import InitializeFastAPI, RunFastAPI
 from .web.settings import AppSettings

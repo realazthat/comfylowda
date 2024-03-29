@@ -35,9 +35,7 @@ from datauri import DataURI
 from pydantic import BaseModel
 from slugify import slugify
 
-from comfylowda import lowda_types
-from comfylowda.validation import _CheckModelRoundTrip
-
+from . import lowda_types
 from .comfy_schema import Workflow, WorkflowNode
 from .comfyfs import _Writable
 from .error_utils import _ErrorContext, _YamlDump
@@ -46,6 +44,7 @@ from .lowda_types import (JSON_SERIALIZABLE_TYPES, ComfyRemoteInfo,
                           IsJSONSerializable, JSONSerializable, OutputMapping,
                           OutputPPKind, ProvisioningSpec, UploadWorkflowError,
                           UserIOSpec)
+from .validation import _CheckModelRoundTrip
 
 logger = logging.getLogger(__name__)
 
