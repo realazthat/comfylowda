@@ -35,14 +35,18 @@ OUTPUT_DIR="${PWD}/.deleteme/.data/output"
 mkdir -p "${OUTPUT_DIR}"
 mkdir -p "${INPUT_DIR}"
 
+# --workflow "comfylowda/assets/sdxlturbo_example.json" \
+
+
 python -m comfylowda.cli execute \
+  --yaml-log-path ".logs/execute.yaml" \
+  --json-log-path ".logs/execute.json" \
   --tmp-dir-path .deleteme/tmp/ \
   --debug-path .deleteme/debug/ \
   --debug '1' \
   --log-to-stderr '1' \
   --log-level 'DEBUG' \
   --debug-save-all 1 \
-  --workflow "comfylowda/assets/sdxlturbo_example.json" \
   --api-workflow "comfylowda/assets/sdxlturbo_example_api.json" \
   --object-info "comfylowda/assets/object_info.json" \
   -fs "{\"pfx\":\"file://${OUTPUT_DIR}/\",\"proto\":\"file\",\"mode\":\"w\"}" \

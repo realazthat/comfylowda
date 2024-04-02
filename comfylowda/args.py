@@ -127,7 +127,6 @@ class ServeCommand(ServerArgs, ProvisionerArgs, ServeAppArgs, CommonArgs):
 
 ################################################################################
 class UploadArgs(BaseModel):
-  workflow: Path = Field(..., description='Path to the workflow to upload.')
   api_workflow: Path = Field(...,
                              description='Path to the API workflow to upload.')
   object_info: Path = Field(...,

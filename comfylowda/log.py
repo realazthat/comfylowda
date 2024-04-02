@@ -17,6 +17,15 @@ from .args import CommonArgs
 from .error_utils import _YamlDump
 
 
+class _CustomJSONEncoder(json.JSONEncoder):
+
+  def default(self, obj):
+    try:
+      return super().default(obj)
+    except TypeError:
+      return str(obj)
+
+
 class _CustomFormatter(logging.Formatter, ABC):
 
   def format_exception(self, exc_info):
@@ -56,7 +65,7 @@ class _YAMLFormatter(_CustomFormatter):
 class _JSONFormatter(_CustomFormatter):
 
   def DumpRecordDict(self, record_dict: dict) -> str:
-    return json.dumps(record_dict)
+    return json.dumps(record_dict, cls=_CustomJSONEncoder)
 
 
 async def _SetupLogging(args: CommonArgs) -> None:

@@ -6,7 +6,6 @@
 # the license text.
 
 import asyncio
-import base64
 import enum
 import json
 import logging
@@ -19,6 +18,7 @@ from typing import Any, Dict, List, Literal, Tuple
 from urllib.parse import urlparse
 
 import aiofiles
+import comfy_catapult.comfy_utils
 import fsspec
 import jsonschema
 import pydantic
@@ -32,13 +32,12 @@ from comfy_catapult.comfy_schema import (APIHistoryEntry, APINodeID,
                                          ComfyUIPathTriplet)
 from comfy_catapult.comfy_utils import WatchVar
 from datauri import DataURI
-from pydantic import BaseModel
 from slugify import slugify
 
-from . import lowda_types
+from . import lowda_types, provisioner_types
 from .comfy_schema import Workflow, WorkflowNode
 from .comfyfs import _Writable
-from .error_utils import _ErrorContext, _YamlDump
+from .error_utils import _Error, _ErrorContext, _SuccessOrError, _YamlDump
 from .lowda_types import (JSON_SERIALIZABLE_TYPES, ComfyRemoteInfo,
                           FileUploadMapSpec, InputMapping, InputPPKind, IOSpec,
                           IsJSONSerializable, JSONSerializable, OutputMapping,
@@ -119,6 +118,14 @@ def _FindNode(
       return _FindNodeByName(workflow=workflow, name=node_id_or_name)
     except ValueError:
       return _FindNodeByID(workflow=workflow, node_id=str(node_id_or_name))
+
+
+def _ResolveNode(*, api_workflow: APIWorkflow,
+                 node_id_or_name: int | str) -> APINodeID:
+  with WatchVar(node_id_or_name=node_id_or_name):
+    node_id, _ = comfy_catapult.comfy_utils.GetNode(workflow=api_workflow,
+                                                    id_or_title=node_id_or_name)
+    return node_id
 
 
 class RemoteFileAPIBase(ABC):
@@ -284,8 +291,9 @@ class FSSpecRemoteFileAPI(RemoteFileAPIBase):
                        f'prefixes for this mode: {prefixes}')
 
 
-async def _DownloadURLToB64(*, remote: RemoteFileAPIBase, io_spec: IOSpec,
-                            tmp_dir_path: Path) -> str:
+async def _DownloadURLToB64DataURI(*, remote: RemoteFileAPIBase,
+                                   io_spec: IOSpec,
+                                   tmp_dir_path: Path) -> DataURI:
   with WatchVar(io_spec=io_spec, tmp_dir_path=tmp_dir_path):
     filename = PurePath(urlparse(io_spec.io_url).path).name
     async with aiofiles.tempfile.TemporaryDirectory(
@@ -296,7 +304,7 @@ async def _DownloadURLToB64(*, remote: RemoteFileAPIBase, io_spec: IOSpec,
       await remote.DownloadFile(untrusted_src_io_spec=io_spec,
                                 trusted_dst_path=tmp_path)
       bytes_ = await tmp_path.read_bytes()
-      return base64.b64encode(bytes_).decode('utf-8')
+      return DataURI.make(mimetype=None, data=bytes_, base64=True, charset=None)
 
 
 async def _UploadDataURI(*, remote: RemoteFileAPIBase, src_data_uri: str,
@@ -339,23 +347,14 @@ def _ParseUserIOSpec(user_input_value: JSONSerializable) -> UserIOSpec:
 
 
 class ProvisionerBase(ABC):
-
-  class ProvisionReq(BaseModel):
-    id: str
-    bundle: ProvisioningSpec
-    keepalive: float
-
-  class ProvisionRes(BaseModel):
-    id: str
-    comfy_info: ComfyRemoteInfo
-
-  class TouchReq(BaseModel):
-    id: str
-    keepalive: float
-
-  class TouchRes(BaseModel):
-    success: bool
-    message: str
+  ProvisionReq = provisioner_types.ProvisionReq
+  ProvisionSuccess = provisioner_types.ProvisionSuccess
+  ProvisionError = provisioner_types.ProvisionError
+  ProvisionRes = provisioner_types.ProvisionRes
+  TouchReq = provisioner_types.TouchReq
+  TouchSuccess = provisioner_types.TouchSuccess
+  TouchError = provisioner_types.TouchError
+  TouchRes = provisioner_types.TouchRes
 
   @abstractmethod
   async def Provision(self, req: ProvisionReq) -> ProvisionRes:
@@ -373,17 +372,21 @@ class DumbProvisioner(ProvisionerBase):
 
   async def Provision(
       self, req: ProvisionerBase.ProvisionReq) -> ProvisionerBase.ProvisionRes:
-    return ProvisionerBase.ProvisionRes(id=req.id,
-                                        comfy_info=self._comfy_remote)
+    return ProvisionerBase.ProvisionRes(
+        success=ProvisionerBase.ProvisionSuccess(id=req.id,
+                                                 comfy_info=self._comfy_remote),
+        error=None)
 
   async def Touch(self,
                   req: ProvisionerBase.TouchReq) -> ProvisionerBase.TouchRes:
-    return ProvisionerBase.TouchRes(success=True, message='')
+    return ProvisionerBase.TouchRes(success=ProvisionerBase.TouchSuccess(),
+                                    error=None)
 
 
 class ServerBase(ABC):
   UploadWorkflowReq = lowda_types.UploadWorkflowReq
   UploadWorkflowError = lowda_types.UploadWorkflowError
+  UploadWorkflowSuccess = lowda_types.UploadWorkflowSuccess
   UploadWorkflowRes = lowda_types.UploadWorkflowRes
   DownloadWorkflowReq = lowda_types.DownloadWorkflowReq
   DownloadWorkflowSuccess = lowda_types.DownloadWorkflowSuccess
@@ -394,10 +397,17 @@ class ServerBase(ABC):
   ExecuteError = lowda_types.ExecuteError
   ExecuteRes = lowda_types.ExecuteRes
   TouchReq = lowda_types.TouchReq
+  TouchSuccess = lowda_types.TouchSuccess
+  TouchError = lowda_types.TouchError
   TouchRes = lowda_types.TouchRes
 
   @abstractmethod
   async def UploadWorkflow(self, req: UploadWorkflowReq) -> UploadWorkflowRes:
+    raise NotImplementedError()
+
+  @abstractmethod
+  async def DownloadWorkflow(self,
+                             req: DownloadWorkflowReq) -> DownloadWorkflowRes:
     raise NotImplementedError()
 
   @abstractmethod
@@ -573,9 +583,11 @@ class FilePostProcessor(PostProcessorBase):
 
     dst_user_io_spec = _ParseUserIOSpec(user_input_value)
     if dst_user_io_spec.root == 'base64':
-      return await _DownloadURLToB64(remote=self._remote,
-                                     io_spec=download_io_spec,
-                                     tmp_dir_path=self._tmp_dir_path)
+      data_uri: DataURI = await _DownloadURLToB64DataURI(
+          remote=self._remote,
+          io_spec=download_io_spec,
+          tmp_dir_path=self._tmp_dir_path)
+      return str(data_uri)
     dst_io_spec = dst_user_io_spec.ToIOSpec()
     return await self._remote.CopyFile(untrusted_src_io_spec=download_io_spec,
                                        untrusted_dst_io_spec=dst_io_spec)
@@ -605,19 +617,6 @@ def _GetInputValue(mapping: InputMapping | OutputMapping,
         instance=value,
         schema=mapping.user_json_spec,
         format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
-
-
-class _Error(Exception):
-
-  def __init__(self, *, user_message: str, internal_message: str,
-               status_code: int | None, error_name: str,
-               io_name: str | None) -> None:
-    super().__init__(internal_message)
-    self.user_message = user_message
-    self.internal_message = internal_message
-    self.status_code = status_code
-    self.error_name = error_name
-    self.io_name = io_name
 
 
 class Server(ServerBase):
@@ -675,7 +674,8 @@ class Server(ServerBase):
     logger.info('UploadWorkflow', extra={'error_context': error_context.Dump()})
     try:
       self._workflows[req.workflow_id] = req
-      return ServerBase.UploadWorkflowRes(error=None)
+      return ServerBase.UploadWorkflowRes(
+          success=ServerBase.UploadWorkflowSuccess(), error=None)
     except Exception:
       error_id = str(uuid.uuid4())
       status_code = 500
@@ -691,12 +691,13 @@ class Server(ServerBase):
                        exc_info=True,
                        stack_info=True,
                        extra={'error_context': error_context.Dump()})
-      return ServerBase.UploadWorkflowRes(
-          error=UploadWorkflowError(error_id=error_id,
-                                    status_code=status_code,
-                                    name=error_name,
-                                    message=message,
-                                    context=error_context.UserDump()))
+      return ServerBase.UploadWorkflowRes(success=None,
+                                          error=UploadWorkflowError(
+                                              error_id=error_id,
+                                              status_code=status_code,
+                                              name=error_name,
+                                              message=message,
+                                              context=error_context.UserDump()))
 
   async def _KeepAlive(self, job_id: str, keepalive: float) -> None:
     try:
@@ -714,13 +715,12 @@ class Server(ServerBase):
                        })
 
   async def _UploadValue(self, comfy_info: ComfyRemoteInfo,
-                         workflow_template: Workflow,
                          prepared_api_workflow: APIWorkflow,
                          input_mapping: InputMapping,
                          user_input_value: JSONSerializable) -> None:
     node_id: APINodeID
-    node_id, _, _ = _FindNode(workflow=workflow_template,
-                              node_id_or_name=input_mapping.node)
+    node_id = _ResolveNode(api_workflow=prepared_api_workflow,
+                           node_id_or_name=input_mapping.node)
     pp: InputPPKind = input_mapping.pp
     if node_id not in prepared_api_workflow.root:
       raise ValueError(f'{node_id} not in prepared_workflow.root')
@@ -737,7 +737,6 @@ class Server(ServerBase):
     pydash.set_(node.inputs, input_mapping.field, user_input_value_pp)
 
   async def _UploadValues(self, comfy_info: ComfyRemoteInfo,
-                          workflow_template: Workflow,
                           prepared_api_workflow: APIWorkflow,
                           input_mappings: List[InputMapping],
                           user_input_values: Dict[str, JSONSerializable],
@@ -757,7 +756,6 @@ class Server(ServerBase):
         error_context['user_input_value'] = user_input_value
 
         await self._UploadValue(comfy_info=comfy_info,
-                                workflow_template=workflow_template,
                                 prepared_api_workflow=prepared_api_workflow,
                                 input_mapping=input_mapping,
                                 user_input_value=user_input_value)
@@ -779,10 +777,10 @@ class Server(ServerBase):
                      internal_message=internal_message,
                      status_code=status_code,
                      error_name=error_name,
+                     internal_context=error_context.Dump(),
                      io_name=input_mapping.name) from e
 
   async def _DownloadValue(self, comfy_info: ComfyRemoteInfo,
-                           workflow_template: Workflow,
                            prepared_api_workflow: APIWorkflow,
                            history: APIHistoryEntry,
                            output_mapping: OutputMapping,
@@ -790,8 +788,8 @@ class Server(ServerBase):
                            error_context: _ErrorContext) -> JSONSerializable:
     # TODO: Wrap this in a try-catch and throw a specific error for this input.
     node_id: APINodeID
-    node_id, _, _ = _FindNode(workflow=workflow_template,
-                              node_id_or_name=output_mapping.node)
+    node_id = _ResolveNode(api_workflow=prepared_api_workflow,
+                           node_id_or_name=output_mapping.node)
     pp: OutputPPKind = output_mapping.pp
     if history.outputs is None or node_id not in history.outputs:
       raise ValueError(f'{node_id} not in history.outputs')
@@ -825,9 +823,9 @@ class Server(ServerBase):
                                          node_output_value=node_output_value)
 
   async def _DownloadValues(
-      self, comfy_info: ComfyRemoteInfo, workflow_template: Workflow,
-      output_mappings: List[OutputMapping], prepared_api_workflow: APIWorkflow,
-      history: APIHistoryEntry, user_input_values: Dict[str, JSONSerializable],
+      self, comfy_info: ComfyRemoteInfo, output_mappings: List[OutputMapping],
+      prepared_api_workflow: APIWorkflow, history: APIHistoryEntry,
+      user_input_values: Dict[str, JSONSerializable],
       error_context: _ErrorContext) -> Dict[str, JSONSerializable]:
     user_output_values: Dict[str, JSONSerializable] = {}
     error_context['user_output_values'] = user_output_values
@@ -844,7 +842,6 @@ class Server(ServerBase):
             mode='json', round_trip=True)
         value = await self._DownloadValue(
             comfy_info=comfy_info,
-            workflow_template=workflow_template,
             prepared_api_workflow=prepared_api_workflow,
             history=history,
             output_mapping=output_mapping,
@@ -870,6 +867,7 @@ class Server(ServerBase):
             internal_message=internal_message,
             status_code=status_code,
             error_name=error_name,
+            internal_context=error_context.Dump(),
             io_name=output_mapping.name,
         ) from e
 
@@ -949,10 +947,13 @@ class Server(ServerBase):
     job_debug_path = self._debug_path / f'{slugify(datetime.now().isoformat())}_{req.job_id}'
     await job_debug_path.mkdir(parents=True, exist_ok=True)
     ############################################################################
-    ProvisionReq = ProvisionerBase.ProvisionReq
-    provisioned: ProvisionerBase.ProvisionRes
-    provisioned = await self._provisioner.Provision(
-        ProvisionReq(id=req.job_id, bundle=prov_spec, keepalive=req.keepalive))
+    provisioned: ProvisionerBase.ProvisionSuccess
+    provisioned = await _SuccessOrError(action='provision',
+                                        res=await self._provisioner.Provision(
+                                            ProvisionerBase.ProvisionReq(
+                                                id=req.job_id,
+                                                bundle=prov_spec,
+                                                keepalive=req.keepalive)))
     error_context['provisioned'] = provisioned.model_dump(mode='json',
                                                           round_trip=True)
     logger.info('Successfully provisioned a ComfyUI instance',
@@ -975,7 +976,6 @@ class Server(ServerBase):
           ######################################################################
           await self._UploadValues(
               comfy_info=provisioned.comfy_info,
-              workflow_template=upload_req.template_bundle.workflow_template,
               prepared_api_workflow=prepared_api_workflow,
               input_mappings=upload_req.template_bundle.input_mappings,
               user_input_values=req.user_input_values,
@@ -1004,7 +1004,6 @@ class Server(ServerBase):
           mapped_outputs: Dict[str, JSONSerializable]
           mapped_outputs = await self._DownloadValues(
               comfy_info=provisioned.comfy_info,
-              workflow_template=upload_req.template_bundle.workflow_template,
               output_mappings=upload_req.template_bundle.output_mappings,
               prepared_api_workflow=prepared_api_workflow,
               history=history,
@@ -1031,7 +1030,7 @@ class Server(ServerBase):
       # TODO: Make a nonblocking option that can be queried for status.
 
       success = await self._Execute(req, error_context=error_context.Copy())
-      return Server.ExecuteRes(success=success, error=None)
+      return ServerBase.ExecuteRes(success=success, error=None)
     except Exception as e:
       error_id = uuid.uuid4().hex
       status_code = 500
@@ -1048,17 +1047,27 @@ class Server(ServerBase):
                        exc_info=True,
                        stack_info=True,
                        extra={'error_context': error_context.Dump()})
-      return Server.ExecuteRes(success=None,
-                               error=Server.ExecuteError(
-                                   error_id=error_id,
-                                   status_code=status_code,
-                                   name=error_name,
-                                   message=message,
-                                   context=error_context.UserDump(),
-                               ))
+      return ServerBase.ExecuteRes(success=None,
+                                   error=ServerBase.ExecuteError(
+                                       error_id=error_id,
+                                       status_code=status_code,
+                                       name=error_name,
+                                       message=message,
+                                       context=error_context.UserDump(),
+                                   ))
 
   async def Touch(self, req: TouchReq) -> TouchRes:
     res: ProvisionerBase.TouchRes
     res = await self._provisioner.Touch(
         ProvisionerBase.TouchReq(id=req.job_id, keepalive=req.keepalive))
-    return Server.TouchRes(success=res.success, message=res.message)
+    if res.error is not None:
+      # TODO: Make a utility to propagate errors, and make a new error that
+      # propagates the res.error.
+      return ServerBase.TouchRes(success=None,
+                                 error=ServerBase.TouchError(
+                                     error_id=res.error.error_id,
+                                     status_code=res.error.status_code,
+                                     name=res.error.name,
+                                     message=res.error.message,
+                                     context=res.error.context))
+    return ServerBase.TouchRes(success=ServerBase.TouchSuccess(), error=None)

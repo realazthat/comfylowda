@@ -7,7 +7,7 @@
 
 import enum
 from pathlib import PurePath
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from urllib.parse import urlparse
 
 from comfy_catapult.comfy_schema import (APIHistoryEntry, APINodeID,
@@ -17,7 +17,7 @@ from pydantic import (BaseModel, ConfigDict, Field, RootModel, field_validator,
                       model_validator)
 from typing_extensions import Annotated, Literal
 
-from .comfy_schema import Workflow
+from .base_types import Response, ResponseErrorBase
 
 JSON_SERIALIZABLE_TYPES = (str, int, float, bool, type(None), dict, list, tuple)
 
@@ -337,7 +337,6 @@ expected to use in their output JSON.
 
 
 class WorkflowTemplateBundle(BaseModel):
-  workflow_template: Workflow
   api_workflow_template: APIWorkflow
   important: List[APINodeID]
   object_info: APIObjectInfo
@@ -378,23 +377,23 @@ class WorkflowTemplateBundle(BaseModel):
     return self
 
 
+################################################################################
 class UploadWorkflowReq(BaseModel):
   workflow_id: str
   template_bundle: WorkflowTemplateBundle
   prov_spec: ProvisioningSpec
 
 
-class UploadWorkflowError(BaseModel):
-  error_id: str = Field(..., description='The error id.')
-  status_code: Optional[int] = Field(
-      ..., description='The error status code. To be used in HTTP responses.')
-  name: str = Field(..., description='The error name.')
-  message: str = Field(..., description='The error message.')
-  context: dict = Field(..., description='The error context.')
+class UploadWorkflowSuccess(BaseModel):
+  pass
 
 
-class UploadWorkflowRes(BaseModel):
-  error: Optional[UploadWorkflowError]
+class UploadWorkflowError(ResponseErrorBase):
+  pass
+
+
+class UploadWorkflowRes(Response[UploadWorkflowSuccess, UploadWorkflowError]):
+  pass
 
 
 class DownloadWorkflowReq(BaseModel):
@@ -407,18 +406,13 @@ class DownloadWorkflowSuccess(BaseModel):
   prov_spec: ProvisioningSpec
 
 
-class DownloadWorkflowError(BaseModel):
-  error_id: str = Field(..., description='The error id.')
-  status_code: Optional[int] = Field(
-      ..., description='The error status code. To be used in HTTP responses.')
-  name: str = Field(..., description='The error name.')
-  message: str = Field(..., description='The error message.')
-  context: dict = Field(..., description='The error context.')
+class DownloadWorkflowError(ResponseErrorBase):
+  pass
 
 
-class DownloadWorkflowRes(BaseModel):
-  success: Optional[DownloadWorkflowSuccess]
-  error: Optional[DownloadWorkflowError]
+class DownloadWorkflowRes(Response[DownloadWorkflowSuccess,
+                                   DownloadWorkflowError]):
+  pass
 
 
 class ExecuteReq(BaseModel):
@@ -450,18 +444,12 @@ class ExecuteSuccess(BaseModel):
       'The outputs, as per the OutputMappings specs of the uploaded workflow.')
 
 
-class ExecuteError(BaseModel):
-  error_id: str = Field(..., description='The error id.')
-  status_code: Optional[int] = Field(
-      ..., description='The error status code. To be used in HTTP responses.')
-  name: str = Field(..., description='The error name.')
-  message: str = Field(..., description='The error message.')
-  context: dict = Field(..., description='The error context.')
+class ExecuteError(ResponseErrorBase):
+  pass
 
 
-class ExecuteRes(BaseModel):
-  success: Optional[ExecuteSuccess]
-  error: Optional[ExecuteError]
+class ExecuteRes(Response[ExecuteSuccess, ExecuteError]):
+  pass
 
 
 class TouchReq(BaseModel):
@@ -469,6 +457,16 @@ class TouchReq(BaseModel):
   keepalive: float = Field(..., description='The keepalive time in seconds.')
 
 
-class TouchRes(BaseModel):
-  success: bool = Field(..., description='Whether the touch was successful.')
-  message: str = Field(..., description='A message, maybe useful in failure.')
+class TouchSuccess(BaseModel):
+  pass
+
+
+class TouchError(ResponseErrorBase):
+  pass
+
+
+class TouchRes(Response[TouchSuccess, TouchError]):
+  pass
+
+
+################################################################################

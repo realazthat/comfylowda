@@ -19,7 +19,6 @@ from comfy_catapult.comfy_schema import APIObjectInfo, APIWorkflow
 from rich.console import Console
 from slugify import slugify
 
-from .comfy_schema import Workflow
 from .comfyfs import RegisterComfyUIFS
 from .error_utils import _YamlDump
 from .lowda import DumbProvisioner, FSSpecRemoteFileAPI, Server
@@ -65,8 +64,6 @@ async def amain():
     await tmp_dir_path.mkdir(parents=True, exist_ok=True)
     object_info_path = await Path('comfylowda/assets/object_info.yml'
                                   ).absolute()
-    workflow_path = await Path('comfylowda/assets/sdxlturbo_example.json'
-                               ).absolute()
     api_workflow_path = await Path(
         'comfylowda/assets/sdxlturbo_example_api.json').absolute()
     local_download_path = await Path('.deleteme/lowda_test/local_download'
@@ -122,8 +119,8 @@ async def amain():
         custom_nodes={},
     )
     ############################################################################
-    workflow_template = Workflow.model_validate_json(await
-                                                     workflow_path.read_text())
+    # workflow_template = Workflow.model_validate_json(await
+    #                                                  workflow_path.read_text())
     api_workflow_template = APIWorkflow.model_validate_json(
         await api_workflow_path.read_text())
     object_info = APIObjectInfo.model_validate(
@@ -132,7 +129,6 @@ async def amain():
     job_id = slugify(uuid.uuid4().hex)
 
     template_bundle = WorkflowTemplateBundle(
-        workflow_template=workflow_template,
         api_workflow_template=api_workflow_template,
         important=[],
         object_info=object_info,

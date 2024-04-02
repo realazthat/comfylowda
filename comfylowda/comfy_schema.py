@@ -4,7 +4,7 @@
 # The ComfyLowda project requires contributions made to this file be licensed
 # under the MIT license or a compatible open source license. See LICENSE.md for
 # the license text.
-
+"""Pydantic schema for ComfyUI Workflow json format."""
 from typing import List, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field

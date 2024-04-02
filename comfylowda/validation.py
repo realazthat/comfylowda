@@ -22,8 +22,16 @@ _BaseModelT = TypeVar('_BaseModelT', bound=BaseModel)
 def _CheckModelRoundTrip(*, model: _BaseModelT, t: type[_BaseModelT]) -> None:
   model_data = model.model_dump(mode='json', round_trip=True, by_alias=True)
   model2 = t.model_validate(model_data)
-  if not model2 == model:
-    raise Exception(f'Model=>data=>model round trip failed for {t.__name__}.')
+  if model2 != model:
+    diff = DeepDiff(model, model2)
+    raise Exception(
+        f'pydantic Model=>data=>model round trip failed for {t.__name__}.'
+        '\n  model:'
+        f'\n{textwrap.indent(model.model_dump_json(by_alias=True, indent=2), "    ")}'
+        '\n  model2:'
+        f'\n{textwrap.indent(model2.model_dump_json(by_alias=True, indent=2), "    ")}'
+        '\n  diff:'
+        f'\n{textwrap.indent(pprint.pformat(diff, indent=2), "    ")}')
 
 
 def _CheckJSONRoundTrip(*, json_str: str, t: type[_BaseModelT]) -> None:
