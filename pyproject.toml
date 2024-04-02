@@ -82,7 +82,7 @@ dependencies = [
 [project.optional-dependencies]
 # Set of dependencies that are known to work. To add a new dependency here, add
 # a version range to the `projecct.dependencies` section above, and then run
-# `EXTRA=prod bash scripts/pin-extra-reqs.sh`. Optionally, delete all the
+# `EXTRA=prod bash scripts/utilties/pin-extra-reqs.sh`. Optionally, delete all the
 # contents to repin all the dependencies (probably a good idea to do once in a
 # while).
 prod = [
@@ -153,7 +153,7 @@ prod = [
 ]
 # Set of dev dependencies, all pinned, so that they are known to work. To add a
 # new dependency here, add the unpinned package name here, and then run
-# `EXTRA=dev bash scripts/pin-extra-reqs.sh`.
+# `EXTRA=dev bash scripts/utilties/pin-extra-reqs.sh`.
 dev = [
   "aiofiles==23.2.1",
   "aiohttp==3.9.3",
